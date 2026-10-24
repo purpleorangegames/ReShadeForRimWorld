@@ -14,7 +14,7 @@ Shaders, presets and screenshots go in the RimWorld save folder, in ReShade. You
 
 Presets use the same format as ReShade, so you can bring yours over.
 
-Works on Linux and Windows, Mac is coming.
+Works on Linux and Windows. Mac should work too but isn't tested yet.
 
 Shader packages keep their own licenses.
 
