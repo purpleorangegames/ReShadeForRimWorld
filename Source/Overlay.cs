@@ -260,7 +260,7 @@ public static class Overlay
         if (game && rt.Layers != null)
         {
             bool whole = rt.Preset.GameChangesUI;
-            if (ImGui.Checkbox("Game effects also change the UI", ref whole))
+            if (ImGui.Checkbox("Game effects change both map and UI", ref whole))
             {
                 rt.Preset.GameChangesUI = whole;
                 rt.Publish();
