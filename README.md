@@ -8,7 +8,7 @@ It was made to run on native Linux RimWorld, since ReShade needs Wine/Proton wit
 
 All thanks to ReShade: https://github.com/crosire/reshade
 
-Press Home in game to open the overlay. From there you can turn effects on and off, change their order and settings, edit the shaders and download shader packages from the same list ReShade uses. PrintScreen saves a screenshot.
+Press F2 in game to open the overlay (Home is game speed in RimWorld, you can change the key in Settings). From there you can turn effects on and off, change their order and settings, edit the shaders and download shader packages from the same list ReShade uses. RimWorld's own screenshot (F10) has the effects too.
 
 Effects change the map only, the UI stays as it is. Tick "Game effects also change the UI" to have them change the UI too, like ReShade does. There is also a UI tab with effects that only change the UI, turn it on in Settings.
 

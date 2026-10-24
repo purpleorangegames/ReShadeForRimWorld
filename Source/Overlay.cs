@@ -27,7 +27,24 @@ public static class Overlay
     private static readonly float4 green = new() { X = 0.5f, Y = 0.9f, Z = 0.5f, W = 1f };
     private static readonly float4 yellow = new() { X = 1f, Y = 0.85f, Z = 0.4f, W = 1f };
 
-    public static string KeyName(int key) => Enum.IsDefined(typeof(GlfwKey), key) ? ((GlfwKey)key).ToString() : "Key " + key;
+    public static string KeyName(int key) => key <= 0 ? "None" : Enum.IsDefined(typeof(GlfwKey), key) ? ((GlfwKey)key).ToString() : "Key " + key;
+
+    // opens a folder in the system's file manager
+    public static void OpenFolder(string path)
+    {
+        try
+        {
+            System.IO.Directory.CreateDirectory(path);
+            string opener = OperatingSystem.IsWindows() ? "explorer.exe" : OperatingSystem.IsMacOS() ? "open" : "xdg-open";
+            var info = new System.Diagnostics.ProcessStartInfo(opener) { UseShellExecute = false };
+            info.ArgumentList.Add(path);
+            System.Diagnostics.Process.Start(info);
+        }
+        catch (Exception e)
+        {
+            ReShadeMod.Runtime?.Feature.Say("[ReShade] could not open " + path + ": " + e.Message);
+        }
+    }
 
     // main thread, inside the game's ImGui frame
     public static void Draw()
@@ -502,7 +519,9 @@ public static class Overlay
             }
             browseDir ??= Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
             ImGui.TextDisabled(browseDir);
-            if (ImGui.BeginChild("##browse", new float2 { X = 0, Y = 180 }, ImGuiChildFlags.Borders))
+            // the list takes what's left of the window, leaving room for the plan once a file is picked
+            float browseHeight = Math.Max(140f, ImGui.GetContentRegionAvail().Y - (importPath != null ? 230f : 30f));
+            if (ImGui.BeginChild("##browse", new float2 { X = 0, Y = browseHeight }, ImGuiChildFlags.Borders))
             {
                 try
                 {
@@ -784,7 +803,14 @@ public static class Overlay
             WaitingForKey = 2;
         }
         ImGui.SameLine();
+        if (ImGui.Button("Clear##shotkey"))
+        {
+            s.ScreenshotKey = 0;
+            s.Save();
+        }
+        ImGui.SameLine();
         ImGui.Text("Screenshot key");
+        ImGui.TextColored(grey, "RimWorld's own screenshot (F10) also has the effects.");
 
         ImGui.SeparatorText("Overlay");
         bool showUi = s.ShowUiTab;
@@ -804,6 +830,14 @@ public static class Overlay
         {
             s.ScreenshotPath = screenshotPath.ToString();
             s.Save();
+        }
+        if (ImGui.Button("Take screenshot"))
+        {
+            ReShadeMod.TakeScreenshot();
+        }
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip("Saves the map with and without the effects, no UI");
         }
         bool before = s.SaveBeforeAndAfter;
         if (ImGui.Checkbox("Also save the image without effects", ref before))
@@ -829,13 +863,28 @@ public static class Overlay
         ImGui.TextColored(grey, "Depth effects may need RESHADE_DEPTH_INPUT_IS_REVERSED and similar here.");
 
         ImGui.SeparatorText("Folders");
-        ImGui.TextWrapped("Shaders: " + ReShadeMod.ShadersDir);
-        ImGui.TextWrapped("Textures: " + ReShadeMod.TexturesDir);
-        ImGui.TextWrapped("Presets: " + ReShadeMod.BaseDir);
+        FolderButton("Shaders", ReShadeMod.ShadersDir);
+        FolderButton("Textures", ReShadeMod.TexturesDir);
+        FolderButton("Presets", ReShadeMod.BaseDir);
+        FolderButton("Screenshots", string.IsNullOrWhiteSpace(s.ScreenshotPath) ? ReShadeMod.ScreenshotsDir : s.ScreenshotPath);
         if (rt.StatusMessage.Length > 0)
         {
             ImGui.TextColored(red, rt.StatusMessage);
         }
+    }
+
+    private static void FolderButton(string label, string path)
+    {
+        if (ImGui.Button(label + "##folder" + label))
+        {
+            OpenFolder(path);
+        }
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip("Open in the file manager");
+        }
+        ImGui.SameLine();
+        ImGui.TextDisabled(path);
     }
 
     private static List<string> Lines(ImInputString input)

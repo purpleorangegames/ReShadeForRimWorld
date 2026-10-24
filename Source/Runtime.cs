@@ -495,8 +495,9 @@ public sealed class Runtime
 public sealed class Settings
 {
     public string Path;
-    public int OverlayKey = 268;      // GLFW Home
-    public int ScreenshotKey = 283;   // GLFW PrintScreen
+    // F2: RimWorld uses Home for game speed and PrintScreen is the desktop's screenshot key
+    public int OverlayKey = 291;      // GLFW F2
+    public int ScreenshotKey = 0;     // none, RimWorld's F10 screenshot already has the effects
     public bool SaveBeforeAndAfter = true;
     // the UI tab is for people who want it, off by default
     public bool ShowUiTab;
