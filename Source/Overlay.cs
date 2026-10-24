@@ -93,11 +93,17 @@ public static class Overlay
         bool open = true;
         if (ImGui.Begin("ReShade for RimWorld##ReShadeMain", ref open))
         {
+            DrawPresetBar(rt);
             if (ImGui.BeginTabBar("##tabs"))
             {
-                if (ImGui.BeginTabItem("Home"))
+                if (ImGui.BeginTabItem("Game"))
                 {
-                    DrawHome(rt);
+                    DrawTechniques(rt, rt.Techniques, game: true);
+                    ImGui.EndTabItem();
+                }
+                if (ImGui.BeginTabItem("UI", TabFlags("UI")))
+                {
+                    DrawTechniques(rt, rt.UiTechniques, game: false);
                     ImGui.EndTabItem();
                 }
                 if (ImGui.BeginTabItem("Shaders", TabFlags("Shaders")))
@@ -138,7 +144,7 @@ public static class Overlay
         return ImGuiTabItemFlags.SetSelected;
     }
 
-    private static void DrawHome(Runtime rt)
+    private static void DrawPresetBar(Runtime rt)
     {
         // preset row
         string current = Path.GetFileName(rt.Preset.Path);
@@ -205,12 +211,12 @@ public static class Overlay
             ImGui.EndPopup();
         }
 
-        int loaded = rt.Listed.Count(kv => kv.Value.Success);
         int failedCount = rt.Listed.Count(kv => !kv.Value.Success);
         int waiting = rt.Effects.Count(e => e.Compiling || e.Result == null);
         int techniques = rt.Techniques.Count(t => !t.Hidden);
-        int enabledCount = rt.Techniques.Count(t => t.Enabled);
-        ImGui.Text($"{rt.Effects.Count} effects, {techniques} techniques, {enabledCount} enabled");
+        int gameOn = rt.Techniques.Count(t => t.Enabled);
+        int uiOn = rt.UiTechniques.Count(t => t.Enabled);
+        ImGui.Text($"{rt.Effects.Count} effects, {techniques} techniques, {gameOn} on in Game, {uiOn} on in UI");
         if (failedCount > 0)
         {
             ImGui.SameLine();
@@ -227,7 +233,19 @@ public static class Overlay
         {
             ImGui.TextColored(yellow, "Some effects need ReShade.fxh. Install \"Standard effects\" in the Shaders tab, or copy it into the shaders folder.");
         }
+    }
 
+    // Game: effects on the map (or the whole screen with +UI). UI: effects on the UI layer only.
+    private static void DrawTechniques(Runtime rt, List<TechniqueEntry> list, bool game)
+    {
+        if (!game)
+        {
+            ImGui.TextWrapped("Effects here only change the UI, the map stays as it is. To run an effect on the map and the UI together, tick +UI next to it in the Game tab.");
+            if (rt.Layers == null || UiCapture.Broken)
+            {
+                ImGui.TextColored(red, "UI layers are off, see the log for why.");
+            }
+        }
         ImGui.InputTextWithHint("##filter", "Search techniques", filter.Buffer);
         filter.EvaluateLength();
         string search = filter.ToString().Trim();
@@ -236,7 +254,7 @@ public static class Overlay
         float listHeight = Math.Max(160f, ImGui.GetContentRegionAvail().Y * 0.45f);
         if (ImGui.BeginChild("##techniques", new float2 { X = 0, Y = listHeight }, ImGuiChildFlags.Borders))
         {
-            foreach (var failed in rt.Listed.Where(kv => !kv.Value.Success).OrderBy(kv => kv.Key.Name))
+            foreach (var failed in rt.Listed.Where(kv => game && !kv.Value.Success).OrderBy(kv => kv.Key.Name))
             {
                 ImGui.TextColored(red, $"{failed.Key.Name} failed to compile");
                 if (ImGui.IsItemHovered())
@@ -248,7 +266,6 @@ public static class Overlay
                     Editor.Open(failed.Key.FilePath);
                 }
             }
-            List<TechniqueEntry> list = rt.Techniques;
             // at most one move per frame, the rows are laid out again before the next one
             bool moved = false;
             for (int i = 0; i < list.Count; i++)
@@ -266,6 +283,20 @@ public static class Overlay
                     rt.Publish();
                 }
                 ImGui.SameLine();
+                if (game)
+                {
+                    bool whole = t.Whole;
+                    if (ImGui.Checkbox("+UI##whole", ref whole))
+                    {
+                        t.Whole = whole;
+                        rt.Publish();
+                    }
+                    if (ImGui.IsItemHovered())
+                    {
+                        ImGui.SetTooltip("Also change the UI: runs on the whole screen, after the UI is drawn");
+                    }
+                    ImGui.SameLine();
+                }
                 ImGui.Selectable($"{t.Label}  [{t.Effect.Name}]", false);
                 if (t.Tooltip != null && ImGui.IsItemHovered())
                 {
@@ -327,10 +358,10 @@ public static class Overlay
         // variables of the enabled effects
         if (ImGui.BeginChild("##variables", new float2 { X = 0, Y = 0 }, ImGuiChildFlags.Borders))
         {
-            var effects = rt.Techniques.Where(t => t.Enabled).Select(t => t.Effect).Distinct().ToList();
+            var effects = list.Where(t => t.Enabled).Select(t => t.Effect).Distinct().ToList();
             foreach (Effect e in effects)
             {
-                if (!rt.Listed.TryGetValue(e, out var result) || result.Module == null)
+                if (!rt.Listed.TryGetValue(e.Source ?? e, out var result) || result.Module == null)
                 {
                     continue;
                 }

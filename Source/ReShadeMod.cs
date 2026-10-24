@@ -94,6 +94,27 @@ public class ReShadeMod : Mod
             Feature = new ReShadeFeature(renderer.GetFeatureAt(index), sceneTargets.Current);
             Runtime = new Runtime(Feature);
             renderer.InsertFeature(index, Feature);
+            // UI layers run after the game's UI pass, before its screenshot feature so those include the effects
+            int uiIndex = -1;
+            for (int i = 0; i < renderer.GetFeatureCount(); i++)
+            {
+                if (renderer.GetFeatureAt(i).GetType().Name == "ImGuiRenderFeature")
+                {
+                    uiIndex = i;
+                    break;
+                }
+            }
+            if (uiIndex >= 0)
+            {
+                var layers = new LayerFeature { TexturePaths = new List<string> { TexturesDir } };
+                renderer.InsertFeature(uiIndex + 1, layers);
+                Runtime.Layers = layers;
+                Runtime.Publish();
+            }
+            else
+            {
+                Log.Warning("[ReShade] could not find the game's UI pass, the UI tab won't do anything");
+            }
             composite.Source = Feature.OutputFor;
             new Harmony("tiagocc0.reshadeforrimworld").PatchAll();
             Log.Message($"[ReShade] ready, {Runtime.Effects.Count} effects in {ShadersDir}, preset {Runtime.Preset.Path}");

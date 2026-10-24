@@ -66,6 +66,44 @@ public static class GpuUtil
         cmd.PipelineBarrier(VkPipelineStageFlags.TransferBit, Graphics | VkPipelineStageFlags.TransferBit, VkDependencyFlags.None, default, default, post);
     }
 
+    private static VkImageCopy FullCopy(int width, int height)
+    {
+        var layers = new VkImageSubresourceLayers();
+        layers.AspectMask = VkImageAspectFlags.ColorBit;
+        layers.MipLevel = 0;
+        layers.BaseArrayLayer = 0;
+        layers.LayerCount = 1;
+        var region = new VkImageCopy();
+        region.SrcSubresource = layers;
+        region.DstSubresource = layers;
+        region.Extent = new VkExtent3D(width, height, 1);
+        return region;
+    }
+
+    // src (the screen) is already in TransferSrcOptimal, dst is one of our textures
+    public static void CopyFromTransferSrc(CommandBuffer cmd, VkImage src, VkImage dst, int width, int height)
+    {
+        VkImageMemoryBarrier pre = Barrier(dst, VkImageLayout.ShaderReadOnlyOptimal, VkImageLayout.TransferDstOptimal, AnyRead | AnyWrite, VkAccessFlags.TransferWriteBit);
+        cmd.PipelineBarrier(Graphics | VkPipelineStageFlags.TransferBit, VkPipelineStageFlags.TransferBit, VkDependencyFlags.None, default, default, new ReadOnlySpan<VkImageMemoryBarrier>(in pre));
+        VkImageCopy region = FullCopy(width, height);
+        cmd.CopyImage(src, VkImageLayout.TransferSrcOptimal, dst, VkImageLayout.TransferDstOptimal, new ReadOnlySpan<VkImageCopy>(in region));
+        VkImageMemoryBarrier post = Barrier(dst, VkImageLayout.TransferDstOptimal, VkImageLayout.ShaderReadOnlyOptimal, VkAccessFlags.TransferWriteBit, AnyRead | AnyWrite);
+        cmd.PipelineBarrier(VkPipelineStageFlags.TransferBit, Graphics | VkPipelineStageFlags.TransferBit, VkDependencyFlags.None, default, default, new ReadOnlySpan<VkImageMemoryBarrier>(in post));
+    }
+
+    // src is one of our textures, dst (the screen) is in dstLayout and is left in TransferDstOptimal
+    public static void CopyToTransferDst(CommandBuffer cmd, VkImage src, VkImage dst, int width, int height, VkImageLayout dstLayout)
+    {
+        Span<VkImageMemoryBarrier> pre = stackalloc VkImageMemoryBarrier[2];
+        pre[0] = Barrier(src, VkImageLayout.ShaderReadOnlyOptimal, VkImageLayout.TransferSrcOptimal, AnyWrite, VkAccessFlags.TransferReadBit);
+        pre[1] = Barrier(dst, dstLayout, VkImageLayout.TransferDstOptimal, VkAccessFlags.TransferReadBit, VkAccessFlags.TransferWriteBit);
+        cmd.PipelineBarrier(Graphics | VkPipelineStageFlags.TransferBit, VkPipelineStageFlags.TransferBit, VkDependencyFlags.None, default, default, pre);
+        VkImageCopy region = FullCopy(width, height);
+        cmd.CopyImage(src, VkImageLayout.TransferSrcOptimal, dst, VkImageLayout.TransferDstOptimal, new ReadOnlySpan<VkImageCopy>(in region));
+        VkImageMemoryBarrier post = Barrier(src, VkImageLayout.TransferSrcOptimal, VkImageLayout.ShaderReadOnlyOptimal, VkAccessFlags.TransferReadBit, AnyRead | AnyWrite);
+        cmd.PipelineBarrier(VkPipelineStageFlags.TransferBit, Graphics | VkPipelineStageFlags.TransferBit, VkDependencyFlags.None, default, default, new ReadOnlySpan<VkImageMemoryBarrier>(in post));
+    }
+
     // a new texture goes to ShaderReadOnlyOptimal cleared to transparent black, like ReShade does on creation
     public static unsafe void ClearFresh(CommandBuffer cmd, FxTexture tex)
     {

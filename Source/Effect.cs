@@ -49,12 +49,36 @@ public sealed unsafe class Effect : IDisposable
         public string Defines;
     }
 
-    public volatile CompileResult Result;
+    // a layer copy (UI layer, whole screen) shares its source's compile and may share its values,
+    // but has its own GPU objects since it draws onto a different image
+    public readonly Effect Source;
+    private readonly bool shareValues;
+    private volatile CompileResult result;
+    public CompileResult Result
+    {
+        get => Source != null ? Source.Result : result;
+        set => result = value;
+    }
     public volatile bool Compiling;
     // main thread: set when the source, screen size or definitions changed
     public bool Stale = true;
     // variable values set from the overlay, by uniform name; replaced as a whole, never edited in place
-    public volatile Dictionary<string, float[]> Values = new();
+    private volatile Dictionary<string, float[]> values = new();
+    public Dictionary<string, float[]> Values
+    {
+        get => shareValues ? Source.Values : values;
+        set
+        {
+            if (shareValues)
+            {
+                Source.Values = value;
+            }
+            else
+            {
+                values = value;
+            }
+        }
+    }
 
     // render thread state
     private CompileResult built;
@@ -104,6 +128,13 @@ public sealed unsafe class Effect : IDisposable
     {
         FilePath = filePath;
         sourceStamp = File.GetLastWriteTimeUtc(filePath);
+    }
+
+    public Effect(Effect source, bool shareValues)
+    {
+        Source = source;
+        FilePath = source.FilePath;
+        this.shareValues = shareValues;
     }
 
     // main thread

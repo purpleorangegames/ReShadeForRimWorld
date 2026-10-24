@@ -16,6 +16,8 @@ public sealed class TechniqueEntry
     public string Tooltip;
     public bool Enabled;
     public bool Hidden;
+    // Game tab only: runs on the whole screen (map and UI) instead of the map
+    public bool Whole;
     public string Id => Name + "@" + Effect.Name;
 }
 
@@ -34,6 +36,11 @@ public sealed class Runtime
     public Preset Preset;
     public readonly List<Effect> Effects = new();
     public readonly List<TechniqueEntry> Techniques = new();
+    // the UI tab: same effects, own copies with their own values, drawn on the UI layer
+    public readonly List<TechniqueEntry> UiTechniques = new();
+    private readonly Dictionary<Effect, Effect> uiCopies = new();
+    private readonly Dictionary<Effect, Effect> screenCopies = new();
+    public LayerFeature Layers;
     public readonly Dictionary<Effect, Effect.CompileResult> Listed = new();
     public string StatusMessage = "";
     public readonly Packages Packages = new();
@@ -69,6 +76,9 @@ public sealed class Runtime
         {
             Effects.Remove(gone);
             Techniques.RemoveAll(t => t.Effect == gone);
+            UiTechniques.RemoveAll(t => t.Effect.Source == gone);
+            uiCopies.Remove(gone);
+            screenCopies.Remove(gone);
             Listed.Remove(gone);
         }
         foreach (string path in found)
@@ -195,19 +205,49 @@ public sealed class Runtime
         }
     }
 
-    // keeps the user's order and toggles, adds new techniques where the preset says or at the end
+    public Effect UiCopy(Effect e)
+    {
+        if (!uiCopies.TryGetValue(e, out Effect copy))
+        {
+            uiCopies[e] = copy = new Effect(e, shareValues: false);
+        }
+        return copy;
+    }
+
+    // whole screen runs share the Game tab's values, it's the same technique in the same list
+    private Effect ScreenCopy(Effect e)
+    {
+        if (!screenCopies.TryGetValue(e, out Effect copy))
+        {
+            screenCopies[e] = copy = new Effect(e, shareValues: true);
+        }
+        return copy;
+    }
+
     private void RefreshTechniques(Effect effect, Effect.CompileResult result)
     {
-        var old = Techniques.Where(t => t.Effect == effect).ToList();
         if (!result.Success)
         {
             // keep the old entries so a typo in the editor doesn't lose the list
             return;
         }
-        int insertAt = old.Count > 0 ? Techniques.IndexOf(old[0]) : -1;
-        Techniques.RemoveAll(t => t.Effect == effect);
+        RefreshList(Techniques, effect, result.Module, Preset.Techniques, Preset.TechniqueSorting, Preset.TechniquesScreen);
+        Effect ui = UiCopy(effect);
+        RefreshList(UiTechniques, ui, result.Module, Preset.TechniquesUI, Preset.TechniqueSortingUI, null);
+        ApplyPresetValues(effect, result.Module, effect.Name);
+        ApplyPresetValues(ui, result.Module, UiSection(effect));
+    }
+
+    private static string UiSection(Effect e) => "UI:" + e.Name;
+
+    // keeps the user's order and toggles, adds new techniques where the preset says or at the end
+    private static void RefreshList(List<TechniqueEntry> list, Effect effect, FxModule module, List<string> enabled, List<string> sorting, List<string> whole)
+    {
+        var old = list.Where(t => t.Effect == effect).ToList();
+        int insertAt = old.Count > 0 ? list.IndexOf(old[0]) : -1;
+        list.RemoveAll(t => t.Effect == effect);
         var fresh = new List<TechniqueEntry>();
-        foreach (FxTechnique t in result.Module.techniques)
+        foreach (FxTechnique t in module.techniques)
         {
             var entry = new TechniqueEntry
             {
@@ -218,39 +258,38 @@ public sealed class Runtime
                 Hidden = (t.annotations.Find("hidden")?.value.i[0] ?? 0) != 0
             };
             TechniqueEntry previous = old.FirstOrDefault(o => o.Name == t.name);
-            entry.Enabled = previous?.Enabled ?? Preset.Techniques.Contains(entry.Id);
+            entry.Enabled = previous?.Enabled ?? enabled.Contains(entry.Id);
+            entry.Whole = previous?.Whole ?? (whole != null && whole.Contains(entry.Id));
             fresh.Add(entry);
         }
         if (insertAt >= 0)
         {
-            Techniques.InsertRange(Math.Min(insertAt, Techniques.Count), fresh);
+            list.InsertRange(Math.Min(insertAt, list.Count), fresh);
         }
         else
         {
-            Techniques.AddRange(fresh);
-            SortByPreset();
+            list.AddRange(fresh);
+            SortBy(list, sorting);
         }
-        ApplyPresetValues(effect, result.Module);
     }
 
-    private void SortByPreset()
+    private static void SortBy(List<TechniqueEntry> list, List<string> order)
     {
-        List<string> order = Preset.TechniqueSorting;
         int Rank(TechniqueEntry t)
         {
             int i = order.IndexOf(t.Id);
             return i < 0 ? int.MaxValue : i;
         }
-        var sorted = Techniques.Select((t, i) => (t, i)).OrderBy(x => Rank(x.t)).ThenBy(x => x.i).Select(x => x.t).ToList();
-        Techniques.Clear();
-        Techniques.AddRange(sorted);
+        var sorted = list.Select((t, i) => (t, i)).OrderBy(x => Rank(x.t)).ThenBy(x => x.i).Select(x => x.t).ToList();
+        list.Clear();
+        list.AddRange(sorted);
     }
 
     // starts from the effect's own defaults, then the preset's values on top
-    private void ApplyPresetValues(Effect effect, FxModule module)
+    private void ApplyPresetValues(Effect effect, FxModule module, string section)
     {
         var values = new Dictionary<string, float[]>();
-        Preset.Values.TryGetValue(effect.Name, out var saved);
+        Preset.Values.TryGetValue(section, out var saved);
         foreach (FxUniform u in module.uniforms)
         {
             if (u.annotations.GetString("source") != null || u.type.array_length > 0)
@@ -291,7 +330,14 @@ public sealed class Runtime
     // publishes the enabled techniques to the render thread and remembers them in the preset
     public void Publish()
     {
-        Feature.RenderList = Techniques.Where(t => t.Enabled).Select(t => new RenderItem { Effect = t.Effect, Technique = t.Name }).ToArray();
+        Feature.RenderList = Techniques.Where(t => t.Enabled && !t.Whole).Select(t => new RenderItem { Effect = t.Effect, Technique = t.Name }).ToArray();
+        if (Layers != null)
+        {
+            Layers.ScreenList = Techniques.Where(t => t.Enabled && t.Whole).Select(t => new RenderItem { Effect = ScreenCopy(t.Effect), Technique = t.Name }).ToArray();
+            Layers.UiList = UiTechniques.Where(t => t.Enabled).Select(t => new RenderItem { Effect = t.Effect, Technique = t.Name }).ToArray();
+            // the UI is only taken over from the game while something needs it
+            UiCapture.Wanted = Layers.ScreenList.Length > 0 || Layers.UiList.Length > 0;
+        }
         MarkPresetDirty();
     }
 
@@ -303,28 +349,22 @@ public sealed class Runtime
         bool Pending(string id) => !listedNames.Contains(id.Substring(id.IndexOf('@') + 1));
         Preset.Techniques = Techniques.Where(t => t.Enabled).Select(t => t.Id).Concat(Preset.Techniques.Where(Pending)).Distinct().ToList();
         Preset.TechniqueSorting = Techniques.Select(t => t.Id).Concat(Preset.TechniqueSorting.Where(Pending)).Distinct().ToList();
+        Preset.TechniquesScreen = Techniques.Where(t => t.Whole).Select(t => t.Id).Concat(Preset.TechniquesScreen.Where(Pending)).Distinct().ToList();
+        Preset.TechniquesUI = UiTechniques.Where(t => t.Enabled).Select(t => t.Id).Concat(Preset.TechniquesUI.Where(Pending)).Distinct().ToList();
+        // the UI order only matters once something there was turned on
+        Preset.TechniqueSortingUI = Preset.TechniquesUI.Count == 0 && Preset.TechniqueSortingUI.Count == 0
+            ? new List<string>()
+            : UiTechniques.Select(t => t.Id).Concat(Preset.TechniqueSortingUI.Where(Pending)).Distinct().ToList();
         foreach (Effect e in Effects)
         {
             if (!Listed.TryGetValue(e, out var r) || r.Module == null)
             {
                 continue;
             }
-            // only values that differ from the effect's defaults go in the preset, like ReShade
-            var section = new Dictionary<string, float[]>();
-            foreach (FxUniform u in r.Module.uniforms)
+            SaveValues(e, r.Module, e.Name);
+            if (uiCopies.TryGetValue(e, out Effect ui))
             {
-                if (e.Values.TryGetValue(u.name, out float[] v) && !v.SequenceEqual(Variables.Defaults(u)))
-                {
-                    section[u.name] = v;
-                }
-            }
-            if (section.Count > 0)
-            {
-                Preset.Values[e.Name] = section;
-            }
-            else
-            {
-                Preset.Values.Remove(e.Name);
+                SaveValues(ui, r.Module, UiSection(e));
             }
         }
         try
@@ -337,6 +377,27 @@ public sealed class Runtime
         }
     }
 
+    // only values that differ from the effect's defaults go in the preset, like ReShade
+    private void SaveValues(Effect e, FxModule module, string name)
+    {
+        var section = new Dictionary<string, float[]>();
+        foreach (FxUniform u in module.uniforms)
+        {
+            if (e.Values.TryGetValue(u.name, out float[] v) && !v.SequenceEqual(Variables.Defaults(u)))
+            {
+                section[u.name] = v;
+            }
+        }
+        if (section.Count > 0)
+        {
+            Preset.Values[name] = section;
+        }
+        else
+        {
+            Preset.Values.Remove(name);
+        }
+    }
+
     public void LoadPreset(string path)
     {
         SavePreset();
@@ -346,14 +407,23 @@ public sealed class Runtime
         foreach (TechniqueEntry t in Techniques)
         {
             t.Enabled = Preset.Techniques.Contains(t.Id);
+            t.Whole = Preset.TechniquesScreen.Contains(t.Id);
         }
-        SortByPreset();
+        foreach (TechniqueEntry t in UiTechniques)
+        {
+            t.Enabled = Preset.TechniquesUI.Contains(t.Id);
+        }
+        SortBy(Techniques, Preset.TechniqueSorting);
+        SortBy(UiTechniques, Preset.TechniqueSortingUI);
         foreach (Effect e in Effects)
         {
             e.Values = new Dictionary<string, float[]>();
+            Effect ui = UiCopy(e);
+            ui.Values = new Dictionary<string, float[]>();
             if (Listed.TryGetValue(e, out var r) && r.Module != null)
             {
-                ApplyPresetValues(e, r.Module);
+                ApplyPresetValues(e, r.Module, e.Name);
+                ApplyPresetValues(ui, r.Module, UiSection(e));
             }
         }
         Publish();

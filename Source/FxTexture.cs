@@ -42,6 +42,18 @@ public sealed class FxTexture : IDisposable
     public readonly bool IsDepthStencil;
     public readonly bool Storage;
     private VkImageView[] storageViews = Array.Empty<VkImageView>();
+    private readonly System.Collections.Generic.Dictionary<nint, VkFramebuffer> framebuffers = new();
+
+    // framebuffer over mip 0 for a color-only render pass, kept until the texture goes away
+    public VkFramebuffer Framebuffer(VkRenderPass renderPass)
+    {
+        if (!framebuffers.TryGetValue(renderPass.VkHandle, out VkFramebuffer fb))
+        {
+            fb = GpuUtil.CreateFramebuffer(device, renderPass, new[] { TargetView(false) }, Width, Height);
+            framebuffers[renderPass.VkHandle] = fb;
+        }
+        return fb;
+    }
 
     public FxTexture(GraphicsDevice graphicsDevice, int width, int height, int levels, VkFormat format, string name, bool depthStencil = false, bool storage = false, int dimensions = 2, int depth = 1)
     {
@@ -129,9 +141,15 @@ public sealed class FxTexture : IDisposable
         GpuTextureAllocation a = allocation;
         VkImageView[] views = new[] { srgbView, Levels > 1 ? linearMip0 : default, Levels > 1 ? srgbMip0 : default }.Concat(storageViews).ToArray();
         DeviceEx d = device;
+        VkFramebuffer[] fbs = framebuffers.Values.ToArray();
+        framebuffers.Clear();
         allocation = null;
         GpuGarbage.Add(() =>
         {
+            foreach (VkFramebuffer fb in fbs)
+            {
+                d.DestroyFramebuffer(fb, d.VkAllocator);
+            }
             foreach (VkImageView v in views)
             {
                 if (!v.IsNull())
