@@ -16,6 +16,6 @@ Shader packages keep their own licenses.
 
 Needs Harmony.
 
-The native compiler is built with the scripts in Native (Linux, Windows with MinGW, Mac) from a checkout of crosire/reshade, they apply Native/windows-paths.patch so includes written for Windows also work on Linux and Mac. GitHub Actions builds all three and puts the whole mod in one zip.
+The native compiler is built with the scripts in Native (Linux, Windows with MinGW, Mac) from a checkout of crosire/reshade, they apply Native/windows-paths.patch so includes written for Windows also work on Linux and Mac, and the Mac build also applies Native/apple.patch. GitHub Actions builds all three and puts the whole mod in one zip.
 
 AI was used to help code/fix issues

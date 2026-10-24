@@ -1,0 +1,29 @@
+diff --git a/source/effect_lexer.cpp b/source/effect_lexer.cpp
+index 7d6069e..628c8da 100644
+--- a/source/effect_lexer.cpp
++++ b/source/effect_lexer.cpp
+@@ -1181,7 +1181,7 @@ void reshadefx::lexer::parse_numeric_literal(token &tok) const
+ 	}
+ 	else
+ 	{
+-#if 0
++#if defined(__APPLE__) // Apple's libc++ has no floating point std::from_chars on older SDKs
+ 		exponent += decimal_location - mantissa_size;
+ 
+ 		const bool exponent_negative = exponent < 0;
+diff --git a/source/effect_symbol_table.cpp b/source/effect_symbol_table.cpp
+index 2299f1d..5e55d94 100644
+--- a/source/effect_symbol_table.cpp
++++ b/source/effect_symbol_table.cpp
+@@ -5,7 +5,11 @@
+ 
+ #include "effect_symbol_table.hpp"
+ #include <cassert>
++#if defined(__APPLE__)
++#include <alloca.h>
++#else
+ #include <malloc.h> // alloca
++#endif
+ #include <algorithm> // std::upper_bound, std::sort
+ #include <functional> // std::greater
+ 
