@@ -1,0 +1,97 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # ReShade's effect compiler is built from this exact commit
+  RESHADE_REPO: crosire/reshade
+  RESHADE_REF: 7bf9de8b33bcc76c3177007e65d73c72dd0f34c0
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-24.04
+            script: build-linux.sh
+            file: libreshadefx.so
+          - name: win-x64
+            os: ubuntu-24.04
+            script: build-windows.sh
+            file: reshadefx.dll
+          - name: osx
+            os: macos-14
+            script: build-macos.sh
+            file: libreshadefx.dylib
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.RESHADE_REPO }}
+          ref: ${{ env.RESHADE_REF }}
+          path: reshade
+      - name: SPIR-V headers
+        run: git -C reshade submodule update --init --depth 1 deps/spirv
+      - name: MinGW
+        if: matrix.name == 'win-x64'
+        run: sudo apt-get update && sudo apt-get install -y g++-mingw-w64-x86-64
+      - name: Build
+        run: RESHADE_SRC="$GITHUB_WORKSPACE/reshade" sh Native/${{ matrix.script }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.name }}
+          path: 1.7/Native/${{ matrix.name }}/${{ matrix.file }}
+
+  assembly:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Build
+        run: dotnet build Source -c Release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: assembly
+          path: 1.7/Assemblies/ReShadeForRimWorld.dll
+
+  package:
+    needs: [native, assembly]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Put the mod together
+        run: |
+          mkdir -p out/ReShadeForRimWorld
+          cp -r About LICENSE README.md out/ReShadeForRimWorld/
+          for rid in linux-x64 win-x64 osx; do
+            mkdir -p out/ReShadeForRimWorld/1.7/Native/$rid
+            cp artifacts/native-$rid/* out/ReShadeForRimWorld/1.7/Native/$rid/
+          done
+          mkdir -p out/ReShadeForRimWorld/1.7/Assemblies
+          cp artifacts/assembly/* out/ReShadeForRimWorld/1.7/Assemblies/
+          cd out && zip -r ../ReShadeForRimWorld.zip ReShadeForRimWorld
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ReShadeForRimWorld
+          path: out/ReShadeForRimWorld
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" ReShadeForRimWorld.zip --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --notes "Linux, Windows and Mac builds."

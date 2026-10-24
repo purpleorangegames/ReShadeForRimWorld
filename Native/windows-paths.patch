@@ -1,0 +1,82 @@
+diff --git a/source/effect_preprocessor.cpp b/source/effect_preprocessor.cpp
+index 626d718..8fb2b7a 100644
+--- a/source/effect_preprocessor.cpp
++++ b/source/effect_preprocessor.cpp
+@@ -62,6 +62,46 @@ static const int s_precedence_lookup[] = {
+ 	11, 11, 11, 11 // unary operators
+ };
+ 
++// Shaders are written on Windows: includes may use backslashes and a different case than the file on disk.
++// This turns such a path into the real one when it exists, so they also work on case-sensitive file systems.
++static bool exists_windows_style(std::filesystem::path &path)
++{
++	std::error_code ec;
++	if (std::filesystem::exists(path, ec))
++		return true;
++
++	std::string text = path.u8string();
++	std::replace(text.begin(), text.end(), '\\', '/');
++	std::filesystem::path normalized = std::filesystem::u8path(text).lexically_normal();
++	if (std::filesystem::exists(normalized, ec))
++		return path = normalized, true;
++
++	std::filesystem::path resolved = normalized.root_path();
++	for (const std::filesystem::path &part : normalized.relative_path())
++	{
++		std::filesystem::path next = resolved / part;
++		if (!std::filesystem::exists(next, ec))
++		{
++			const std::string wanted = part.u8string();
++			bool found = false;
++			for (const std::filesystem::directory_entry &entry : std::filesystem::directory_iterator(resolved.empty() ? std::filesystem::path(".") : resolved, ec))
++			{
++				const std::string name = entry.path().filename().u8string();
++				if (name.size() == wanted.size() && std::equal(name.begin(), name.end(), wanted.begin(), [](char a, char b) { return std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b)); }))
++				{
++					next = entry.path();
++					found = true;
++					break;
++				}
++			}
++			if (!found)
++				return false;
++		}
++		resolved = next;
++	}
++	return path = resolved, true;
++}
++
+ static bool read_file(const std::filesystem::path &path, std::string &file_data)
+ {
+ 	// Read file contents into memory
+@@ -733,10 +773,9 @@ void reshadefx::preprocessor::parse_include()
+ 	std::filesystem::path file_path = std::filesystem::u8path(_output_location.source);
+ 	file_path.replace_filename(file_name);
+ 
+-	std::error_code ec;
+-	if (!std::filesystem::exists(file_path, ec))
++	if (!exists_windows_style(file_path))
+ 		for (const std::filesystem::path &include_path : _include_paths)
+-			if (std::filesystem::exists(file_path = include_path / file_name, ec))
++			if (exists_windows_style(file_path = include_path / file_name))
+ 				break;
+ 
+ 	const std::string file_path_string = file_path.u8string();
+@@ -933,13 +972,13 @@ bool reshadefx::preprocessor::evaluate_expression()
+ 				if (has_parentheses && !expect(tokenid::parenthesis_close))
+ 					return false;
+ 
+-				std::error_code ec;
+-				if (!std::filesystem::exists(file_path, ec))
++				bool found = exists_windows_style(file_path);
++				if (!found)
+ 					for (const std::filesystem::path &include_path : _include_paths)
+-						if (std::filesystem::exists(file_path = include_path / file_name, ec))
++						if ((found = exists_windows_style(file_path = include_path / file_name)))
+ 							break;
+ 
+-				rpn[rpn_index++] = { std::filesystem::exists(file_path, ec) ? 1 : 0, false };
++				rpn[rpn_index++] = { found ? 1 : 0, false };
+ 				continue;
+ 			}
+ 			if (_token.literal_as_string == "defined")

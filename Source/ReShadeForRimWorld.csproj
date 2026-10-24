@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>ReShadeForRimWorld</AssemblyName>
+    <RootNamespace>ReShadeForRimWorld</RootNamespace>
+    <Version>0.1.0</Version>
+    <Authors>tiagocc0</Authors>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Deterministic>true</Deterministic>
+    <DebugType>none</DebugType>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+    <GenerateDependencyFile>false</GenerateDependencyFile>
+    <OutputPath>../1.7/Assemblies/</OutputPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- reference only, the game and the Harmony mod provide the real dlls -->
+    <PackageReference Include="Krafs.Rimworld.Ref" Version="1.7.4985-unstable" ExcludeAssets="runtime" PrivateAssets="all" />
+    <PackageReference Include="Lib.Harmony.Ref" Version="3.0.0-rc.3" ExcludeAssets="runtime" PrivateAssets="all" />
+  </ItemGroup>
+</Project>
