@@ -12,7 +12,7 @@ Press Home in game to open the overlay. From there you can turn effects on and o
 
 Shaders, presets and screenshots go in the RimWorld save folder, in ReShade. You can also copy your own shaders into ReShade/reshade-shaders/Shaders.
 
-Presets use the same format as ReShade, so you can bring yours over.
+Presets use the same format as ReShade, so you can bring yours over. Import picks a preset .ini, installs only the shaders it uses and loads it. Presets that other mods have in a presets folder show up there too.
 
 Works on Linux and Windows. Mac should work too but isn't tested yet.
 

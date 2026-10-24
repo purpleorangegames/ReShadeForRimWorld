@@ -37,6 +37,8 @@ public sealed class Runtime
     public readonly Dictionary<Effect, Effect.CompileResult> Listed = new();
     public string StatusMessage = "";
     public readonly Packages Packages = new();
+    // a preset waiting for its packages to finish installing
+    public string PendingPreset;
 
     private readonly Dictionary<Effect, int> compiledWidth = new();
     private int running;
@@ -115,6 +117,12 @@ public sealed class Runtime
             // newly installed or removed shaders get picked up right away
             Packages.ReloadNeeded = false;
             ScanEffects();
+        }
+        if (PendingPreset != null && !Packages.Busy && !Packages.ReloadNeeded)
+        {
+            string path = PendingPreset;
+            PendingPreset = null;
+            LoadPreset(path);
         }
         int width = Feature.SceneWidth, height = Feature.SceneHeight;
         if (width > 0)
@@ -349,6 +357,52 @@ public sealed class Runtime
             }
         }
         Publish();
+    }
+
+    // copies a preset from elsewhere into the ReShade folder (keeping both if the name is taken) and loads it,
+    // after the packages it needs are installed when there are any
+    public string ImportPreset(string source, bool waitForPackages)
+    {
+        string name = Path.GetFileName(source);
+        string target = Path.Combine(ReShadeMod.BaseDir, name);
+        if (Path.GetFullPath(source) != Path.GetFullPath(target))
+        {
+            for (int i = 2; File.Exists(target) && File.ReadAllText(target) != File.ReadAllText(source); i++)
+            {
+                target = Path.Combine(ReShadeMod.BaseDir, Path.GetFileNameWithoutExtension(name) + " " + i + Path.GetExtension(name));
+            }
+            Directory.CreateDirectory(ReShadeMod.BaseDir);
+            File.Copy(source, target, true);
+        }
+        if (waitForPackages)
+        {
+            PendingPreset = target;
+        }
+        else
+        {
+            LoadPreset(target);
+        }
+        return target;
+    }
+
+    // presets other mods ship in a "presets" folder, like the old TiagoReshadePresets
+    public IEnumerable<(string mod, string path)> ModPresets()
+    {
+        foreach (Verse.ModContentPack mod in Verse.LoadedModManager.RunningMods)
+        {
+            foreach (string dir in new[] { "presets", "Presets", "ReShade" })
+            {
+                string folder = Path.Combine(mod.RootDir, dir);
+                if (!Directory.Exists(folder))
+                {
+                    continue;
+                }
+                foreach (string ini in Directory.EnumerateFiles(folder, "*.ini", SearchOption.AllDirectories))
+                {
+                    yield return (mod.Name, ini);
+                }
+            }
+        }
     }
 
     public IEnumerable<string> PresetFiles()

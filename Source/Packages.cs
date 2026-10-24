@@ -167,6 +167,11 @@ public sealed class Packages
         }
         List<EffectPackage> install = reinstallInstalled ? List.Where(IsInstalled).ToList() : ToInstall;
         List<EffectPackage> remove = reinstallInstalled ? new List<EffectPackage>() : ToRemove;
+        Run(install, remove);
+    }
+
+    private void Run(List<EffectPackage> install, List<EffectPackage> remove)
+    {
         if (install.Count == 0 && remove.Count == 0)
         {
             return;
@@ -208,6 +213,76 @@ public sealed class Packages
                 Busy = false;
             }
         });
+    }
+
+    // what a preset needs, worked out the way ReShade's installer does it: each technique names its .fx file,
+    // and the package list says which package ships which .fx
+    public sealed class PresetPlan
+    {
+        public string PresetPath;
+        public List<EffectPackage> Packages = new();
+        public Dictionary<EffectPackage, List<string>> Effects = new();
+        public List<string> AlreadyHave = new();
+        public List<string> NotFound = new();
+        public bool AddsStandard;
+    }
+
+    public PresetPlan Plan(string presetPath)
+    {
+        var plan = new PresetPlan { PresetPath = presetPath };
+        Preset preset = Preset.Load(presetPath);
+        var needed = preset.Techniques.Select(t => t.Substring(t.IndexOf('@') + 1)).Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(x => x).ToList();
+        var local = new HashSet<string>(
+            Directory.Exists(ReShadeMod.ShadersDir) ? Directory.EnumerateFiles(ReShadeMod.ShadersDir, "*.fx", SearchOption.AllDirectories).Select(Path.GetFileName) : Enumerable.Empty<string>(),
+            StringComparer.OrdinalIgnoreCase);
+        foreach (string fx in needed)
+        {
+            if (local.Contains(fx))
+            {
+                plan.AlreadyHave.Add(fx);
+                continue;
+            }
+            EffectPackage p = List.FirstOrDefault(x => x.EffectFiles.Contains(fx, StringComparer.OrdinalIgnoreCase));
+            if (p == null)
+            {
+                plan.NotFound.Add(fx);
+                continue;
+            }
+            if (!plan.Effects.TryGetValue(p, out var list))
+            {
+                plan.Effects[p] = list = new List<string>();
+                plan.Packages.Add(p);
+            }
+            list.Add(fx);
+        }
+        // most effects include ReShade.fxh, which comes with the standard package
+        bool hasCommon = Directory.Exists(ReShadeMod.ShadersDir) && Directory.EnumerateFiles(ReShadeMod.ShadersDir, "ReShade.fxh", SearchOption.AllDirectories).Any();
+        EffectPackage standard = List.FirstOrDefault(x => x.Required);
+        if (!hasCommon && standard != null && !plan.Packages.Contains(standard) && (plan.Packages.Count > 0 || plan.AlreadyHave.Count > 0))
+        {
+            plan.Packages.Insert(0, standard);
+            plan.Effects[standard] = new List<string>();
+            plan.AddsStandard = true;
+        }
+        return plan;
+    }
+
+    // installs only the effects the preset uses from each package, nothing gets removed
+    public void InstallFor(PresetPlan plan)
+    {
+        if (Busy)
+        {
+            return;
+        }
+        foreach (EffectPackage p in plan.Packages)
+        {
+            List<string> wanted = plan.Effects[p];
+            p.SkippedEffects = wanted.Count == 0 && p.Required
+                ? new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                : new HashSet<string>(p.EffectFiles.Where(fx => !wanted.Contains(fx, StringComparer.OrdinalIgnoreCase)), StringComparer.OrdinalIgnoreCase);
+            p.Selected = true;
+        }
+        Run(plan.Packages, new List<EffectPackage>());
     }
 
     private void AddLog(string line)

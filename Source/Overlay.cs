@@ -51,6 +51,10 @@ public static class Overlay
         {
             DrawWindow(rt);
         }
+        if (importOpen)
+        {
+            DrawImport(rt);
+        }
         Editor.DrawAll(rt);
     }
 
@@ -138,7 +142,7 @@ public static class Overlay
     {
         // preset row
         string current = Path.GetFileName(rt.Preset.Path);
-        ImGui.PushItemWidth(-160);
+        ImGui.PushItemWidth(-220);
         if (ImGui.BeginCombo("##preset", current))
         {
             foreach (string file in rt.PresetFiles())
@@ -160,6 +164,15 @@ public static class Overlay
         if (ImGui.IsItemHovered())
         {
             ImGui.SetTooltip("New preset");
+        }
+        ImGui.SameLine();
+        if (ImGui.Button("Import"))
+        {
+            importOpen = true;
+        }
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip("Load a preset .ini and install the shaders it needs");
         }
         ImGui.SameLine();
         if (ImGui.Button("Reload"))
@@ -364,6 +377,156 @@ public static class Overlay
     }
 
     private static bool packagesRequested;
+
+    // Import: pick a preset .ini, see which packages it needs, install them and load it
+    private static bool importOpen;
+    private static string browseDir;
+    private static string importPath;
+    private static Packages.PresetPlan importPlan;
+    private static int planListCount = -1;
+    private static readonly ImInputString importPathInput = new(1024);
+
+    private static void ChooseImport(string path)
+    {
+        importPath = path;
+        importPlan = null;
+        importPathInput.SetValue(path);
+    }
+
+    private static void DrawImport(Runtime rt)
+    {
+        Packages pk = rt.Packages;
+        ImGui.SetNextWindowSize(new float2 { X = 620, Y = 640 }, ImGuiCond.FirstUseEver);
+        bool open = true;
+        if (ImGui.Begin("Import preset##ReShadeImport", ref open))
+        {
+            var fromMods = rt.ModPresets().GroupBy(x => Path.GetFullPath(x.path).ToLowerInvariant()).Select(g => g.First()).ToList();
+            if (fromMods.Count > 0)
+            {
+                ImGui.SeparatorText("Presets from your mods");
+                foreach (var (mod, path) in fromMods)
+                {
+                    if (ImGui.Selectable($"{mod}: {Path.GetFileName(path)}##{path}", importPath == path))
+                    {
+                        ChooseImport(path);
+                    }
+                }
+            }
+
+            ImGui.SeparatorText("Or a file");
+            ImGui.PushItemWidth(-70);
+            ImGui.InputText("##importpath", importPathInput);
+            ImGui.PopItemWidth();
+            ImGui.SameLine();
+            if (ImGui.Button("Use") && File.Exists(importPathInput.ToString().Trim()))
+            {
+                ChooseImport(importPathInput.ToString().Trim());
+            }
+            browseDir ??= Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            ImGui.TextDisabled(browseDir);
+            if (ImGui.BeginChild("##browse", new float2 { X = 0, Y = 180 }, ImGuiChildFlags.Borders))
+            {
+                try
+                {
+                    DirectoryInfo parent = Directory.GetParent(browseDir);
+                    if (parent != null && ImGui.Selectable("[..]"))
+                    {
+                        browseDir = parent.FullName;
+                    }
+                    foreach (string dir in Directory.EnumerateDirectories(browseDir).Where(d => !Path.GetFileName(d).StartsWith(".")).OrderBy(d => d, StringComparer.OrdinalIgnoreCase))
+                    {
+                        if (ImGui.Selectable("[" + Path.GetFileName(dir) + "]##" + dir))
+                        {
+                            browseDir = dir;
+                        }
+                    }
+                    foreach (string ini in Directory.EnumerateFiles(browseDir, "*.ini").OrderBy(f => f, StringComparer.OrdinalIgnoreCase))
+                    {
+                        if (ImGui.Selectable(Path.GetFileName(ini) + "##" + ini, importPath == ini))
+                        {
+                            ChooseImport(ini);
+                        }
+                    }
+                }
+                catch (Exception e)
+                {
+                    ImGui.TextColored(red, e.Message);
+                }
+            }
+            ImGui.EndChild();
+
+            if (importPath != null)
+            {
+                ImGui.SeparatorText(Path.GetFileName(importPath));
+                if (pk.List.Count == 0)
+                {
+                    if (!pk.Busy)
+                    {
+                        pk.Refresh();
+                    }
+                    ImGui.Text("Getting ReShade's package list...");
+                }
+                else
+                {
+                    if (importPlan == null || importPlan.PresetPath != importPath || planListCount != pk.List.Count)
+                    {
+                        importPlan = pk.Plan(importPath);
+                        planListCount = pk.List.Count;
+                    }
+                    Packages.PresetPlan plan = importPlan;
+                    if (plan.Packages.Count == 0 && plan.NotFound.Count == 0)
+                    {
+                        ImGui.TextColored(green, plan.AlreadyHave.Count > 0 ? "You already have every effect it uses." : "This preset has no techniques turned on.");
+                    }
+                    foreach (EffectPackage p in plan.Packages)
+                    {
+                        List<string> fx = plan.Effects[p];
+                        ImGui.BulletText(fx.Count == 0 ? $"{p.Name} (most effects need it)" : $"{p.Name}: {string.Join(", ", fx)}");
+                    }
+                    if (plan.AlreadyHave.Count > 0)
+                    {
+                        ImGui.TextColored(grey, $"Already installed: {string.Join(", ", plan.AlreadyHave)}");
+                    }
+                    if (plan.NotFound.Count > 0)
+                    {
+                        ImGui.TextColored(yellow, $"Not in any package on ReShade's list, copy these in yourself: {string.Join(", ", plan.NotFound)}");
+                    }
+                    ImGui.BeginDisabled(pk.Busy);
+                    if (plan.Packages.Count > 0 && ImGui.Button($"Install {plan.Packages.Count} package(s) and load"))
+                    {
+                        pk.InstallFor(plan);
+                        rt.ImportPreset(importPath, waitForPackages: true);
+                    }
+                    if (plan.Packages.Count > 0)
+                    {
+                        ImGui.SameLine();
+                    }
+                    if (ImGui.Button("Load only"))
+                    {
+                        rt.ImportPreset(importPath, waitForPackages: false);
+                    }
+                    ImGui.EndDisabled();
+                }
+            }
+            if (pk.Busy)
+            {
+                ImGui.TextColored(yellow, pk.Status);
+            }
+            else if (rt.PendingPreset == null && pk.Status.Length > 0 && pk.Status.StartsWith("Done"))
+            {
+                ImGui.Text(pk.Status);
+            }
+            if (pk.Error.Length > 0)
+            {
+                ImGui.TextColored(red, pk.Error);
+            }
+        }
+        ImGui.End();
+        if (!open)
+        {
+            importOpen = false;
+        }
+    }
 
     // ReShade's installer list of effect packages, installed into reshade-shaders the same way.
     // A tick means "I want this installed": Apply installs new ticks and removes unticked installed packages.
