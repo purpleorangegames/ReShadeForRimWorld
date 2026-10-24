@@ -460,7 +460,7 @@ public sealed class Packages
             }
             else if (section != null && line.Length > 0)
             {
-                Installed[section].Add(line);
+                Installed[section].Add(ReShadeMod.FromStored(line));
             }
         }
     }
@@ -473,7 +473,7 @@ public sealed class Packages
             foreach (var kv in Installed)
             {
                 lines.Add("[" + kv.Key + "]");
-                lines.AddRange(kv.Value);
+                lines.AddRange(kv.Value.Select(ReShadeMod.ToStored));
                 lines.Add("");
             }
         }

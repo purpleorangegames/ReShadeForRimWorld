@@ -14,7 +14,7 @@ cp "$RESHADE_SRC"/source/effect_* "$WORK/source/"
 (cd "$WORK" && patch -p1 --quiet < "$HERE/windows-paths.patch" && patch -p1 --quiet < "$HERE/apple.patch")
 S="$WORK/source"
 clang++ -std=c++20 -O2 -dynamiclib -fvisibility=hidden -DNDEBUG -Wno-deprecated-declarations \
-  -arch arm64 -arch x86_64 -mmacosx-version-min=11.0 \
+  -arch arm64 -arch x86_64 -mmacosx-version-min=11.0 -install_name @rpath/libreshadefx.dylib \
   -I"$S" -I"$RESHADE_SRC/deps/spirv/include/spirv/unified1" -I"$RESHADE_SRC/deps/spirv/include" \
   "$S/effect_lexer.cpp" "$S/effect_preprocessor.cpp" "$S/effect_parser_exp.cpp" "$S/effect_parser_stmt.cpp" \
   "$S/effect_symbol_table.cpp" "$S/effect_expression.cpp" "$S/effect_codegen_spirv.cpp" \

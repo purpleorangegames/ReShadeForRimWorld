@@ -25,6 +25,37 @@ public class ReShadeMod : Mod
     public static string ScreenshotTriggerFile => Path.Combine(BaseDir, "TakeScreenshot");
     public static Runtime Runtime;
 
+    // config files keep paths inside the ReShade folder relative to it, so they still work if the save folder moves
+    public static string ToStored(string path)
+    {
+        if (string.IsNullOrEmpty(path))
+        {
+            return "";
+        }
+        string full = Path.GetFullPath(path);
+        string root = Path.GetFullPath(BaseDir) + Path.DirectorySeparatorChar;
+        return full.StartsWith(root, OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal) ? full.Substring(root.Length).Replace('\\', '/') : full;
+    }
+
+    public static string FromStored(string stored)
+    {
+        if (string.IsNullOrWhiteSpace(stored))
+        {
+            return "";
+        }
+        string text = stored.Trim();
+        // ReShade writes .\ReShadePreset.ini style paths
+        if (text.StartsWith(".\\") || text.StartsWith("./"))
+        {
+            text = text.Substring(2);
+        }
+        if (Path.IsPathRooted(text))
+        {
+            return text;
+        }
+        return Path.GetFullPath(Path.Combine(BaseDir, text.Replace('\\', Path.DirectorySeparatorChar)));
+    }
+
     public ReShadeMod(ModContentPack content) : base(content)
     {
         NativeFx.Init(content.RootDir);

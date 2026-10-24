@@ -458,8 +458,8 @@ public sealed class Settings
                 case "KeyOverlay": int.TryParse(value, out s.OverlayKey); break;
                 case "KeyScreenshot": int.TryParse(value, out s.ScreenshotKey); break;
                 case "SaveBeforeShot": s.SaveBeforeAndAfter = value == "1"; break;
-                case "SavePath": s.ScreenshotPath = value; break;
-                case "PresetPath": s.PresetPath = value; break;
+                case "SavePath": s.ScreenshotPath = ReShadeMod.FromStored(value); break;
+                case "PresetPath": s.PresetPath = ReShadeMod.FromStored(value); break;
                 case "PreprocessorDefinitions": s.GlobalDefinitions = value.Split(',').Select(v => v.Trim()).Where(v => v.Length > 0).ToList(); break;
             }
         }
@@ -472,7 +472,7 @@ public sealed class Settings
         File.WriteAllLines(Path, new[]
         {
             "[GENERAL]",
-            "PresetPath=" + PresetPath,
+            "PresetPath=" + ReShadeMod.ToStored(PresetPath),
             "PreprocessorDefinitions=" + string.Join(",", GlobalDefinitions),
             "",
             "[INPUT]",
@@ -480,7 +480,7 @@ public sealed class Settings
             "KeyScreenshot=" + ScreenshotKey.ToString(CultureInfo.InvariantCulture),
             "",
             "[SCREENSHOT]",
-            "SavePath=" + ScreenshotPath,
+            "SavePath=" + ReShadeMod.ToStored(ScreenshotPath),
             "SaveBeforeShot=" + (SaveBeforeAndAfter ? "1" : "0")
         });
     }
