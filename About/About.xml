@@ -23,6 +23,10 @@
 
 Not made by or affiliated with crosire or the ReShade project.
 
+It was made to run on native Linux RimWorld, since ReShade needs Wine/Proton with Windows RimWorld to work on Linux. And to have a ReShade port that can be installed directly from the Workshop, so ReShade can reach more people.
+
+All thanks to ReShade: https://github.com/crosire/reshade
+
 Press Home in game to open the overlay. From there you can turn effects on and off, change their order and settings, edit the shaders and download shader packages from the same list ReShade uses. PrintScreen saves a screenshot.
 
 Presets use the same format as ReShade, so you can bring yours over.

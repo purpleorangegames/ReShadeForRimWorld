@@ -4,6 +4,10 @@ Loads ReShade .fx shaders in RimWorld 1.7, using ReShade's own effect compiler.
 
 Not made by or affiliated with crosire or the ReShade project.
 
+It was made to run on native Linux RimWorld, since ReShade needs Wine/Proton with Windows RimWorld to work on Linux. And to have a ReShade port that can be installed directly from the Workshop, so ReShade can reach more people.
+
+All thanks to ReShade: https://github.com/crosire/reshade
+
 Press Home in game to open the overlay. From there you can turn effects on and off, change their order and settings, edit the shaders and download shader packages from the same list ReShade uses. PrintScreen saves a screenshot.
 
 Shaders, presets and screenshots go in the RimWorld save folder, in ReShade. You can also copy your own shaders into ReShade/reshade-shaders/Shaders.
