@@ -106,7 +106,8 @@ public class ReShadeMod : Mod
             }
             if (uiIndex >= 0)
             {
-                var layers = new LayerFeature { TexturePaths = new List<string> { TexturesDir } };
+                IRenderFeature postFx = renderer.GetFeatureAt(index + 1);
+                var layers = new LayerFeature(sceneTargets.Current, () => postFx.IsActive) { TexturePaths = new List<string> { TexturesDir } };
                 renderer.InsertFeature(uiIndex + 1, layers);
                 Runtime.Layers = layers;
                 Runtime.Publish();

@@ -16,8 +16,6 @@ public sealed class TechniqueEntry
     public string Tooltip;
     public bool Enabled;
     public bool Hidden;
-    // Game tab only: runs on the whole screen (map and UI) instead of the map
-    public bool Whole;
     public string Id => Name + "@" + Effect.Name;
 }
 
@@ -214,7 +212,7 @@ public sealed class Runtime
         return copy;
     }
 
-    // whole screen runs share the Game tab's values, it's the same technique in the same list
+    // the Game list run on the whole screen shares the Game tab's values, it's the same list
     private Effect ScreenCopy(Effect e)
     {
         if (!screenCopies.TryGetValue(e, out Effect copy))
@@ -231,9 +229,9 @@ public sealed class Runtime
             // keep the old entries so a typo in the editor doesn't lose the list
             return;
         }
-        RefreshList(Techniques, effect, result.Module, Preset.Techniques, Preset.TechniqueSorting, Preset.TechniquesScreen);
+        RefreshList(Techniques, effect, result.Module, Preset.Techniques, Preset.TechniqueSorting);
         Effect ui = UiCopy(effect);
-        RefreshList(UiTechniques, ui, result.Module, Preset.TechniquesUI, Preset.TechniqueSortingUI, null);
+        RefreshList(UiTechniques, ui, result.Module, Preset.TechniquesUI, Preset.TechniqueSortingUI);
         ApplyPresetValues(effect, result.Module, effect.Name);
         ApplyPresetValues(ui, result.Module, UiSection(effect));
     }
@@ -241,7 +239,7 @@ public sealed class Runtime
     private static string UiSection(Effect e) => "UI:" + e.Name;
 
     // keeps the user's order and toggles, adds new techniques where the preset says or at the end
-    private static void RefreshList(List<TechniqueEntry> list, Effect effect, FxModule module, List<string> enabled, List<string> sorting, List<string> whole)
+    private static void RefreshList(List<TechniqueEntry> list, Effect effect, FxModule module, List<string> enabled, List<string> sorting)
     {
         var old = list.Where(t => t.Effect == effect).ToList();
         int insertAt = old.Count > 0 ? list.IndexOf(old[0]) : -1;
@@ -259,7 +257,6 @@ public sealed class Runtime
             };
             TechniqueEntry previous = old.FirstOrDefault(o => o.Name == t.name);
             entry.Enabled = previous?.Enabled ?? enabled.Contains(entry.Id);
-            entry.Whole = previous?.Whole ?? (whole != null && whole.Contains(entry.Id));
             fresh.Add(entry);
         }
         if (insertAt >= 0)
@@ -330,11 +327,15 @@ public sealed class Runtime
     // publishes the enabled techniques to the render thread and remembers them in the preset
     public void Publish()
     {
-        Feature.RenderList = Techniques.Where(t => t.Enabled && !t.Whole).Select(t => new RenderItem { Effect = t.Effect, Technique = t.Name }).ToArray();
+        // the Game list runs on the map, or with "also change the UI" on the whole screen after the UI is drawn, like ReShade
+        bool whole = Preset.GameChangesUI && Layers != null;
+        RenderItem[] game = Techniques.Where(t => t.Enabled).Select(t => new RenderItem { Effect = whole ? ScreenCopy(t.Effect) : t.Effect, Technique = t.Name }).ToArray();
+        Feature.RenderList = whole ? Array.Empty<RenderItem>() : game;
         if (Layers != null)
         {
-            Layers.ScreenList = Techniques.Where(t => t.Enabled && t.Whole).Select(t => new RenderItem { Effect = ScreenCopy(t.Effect), Technique = t.Name }).ToArray();
-            Layers.UiList = UiTechniques.Where(t => t.Enabled).Select(t => new RenderItem { Effect = t.Effect, Technique = t.Name }).ToArray();
+            Layers.ScreenList = whole ? game : Array.Empty<RenderItem>();
+            // the UI tab's effects only run while the tab is turned on in the settings
+            Layers.UiList = Settings.ShowUiTab ? UiTechniques.Where(t => t.Enabled).Select(t => new RenderItem { Effect = t.Effect, Technique = t.Name }).ToArray() : Array.Empty<RenderItem>();
             // the UI is only taken over from the game while something needs it
             UiCapture.Wanted = Layers.ScreenList.Length > 0 || Layers.UiList.Length > 0;
         }
@@ -349,7 +350,6 @@ public sealed class Runtime
         bool Pending(string id) => !listedNames.Contains(id.Substring(id.IndexOf('@') + 1));
         Preset.Techniques = Techniques.Where(t => t.Enabled).Select(t => t.Id).Concat(Preset.Techniques.Where(Pending)).Distinct().ToList();
         Preset.TechniqueSorting = Techniques.Select(t => t.Id).Concat(Preset.TechniqueSorting.Where(Pending)).Distinct().ToList();
-        Preset.TechniquesScreen = Techniques.Where(t => t.Whole).Select(t => t.Id).Concat(Preset.TechniquesScreen.Where(Pending)).Distinct().ToList();
         Preset.TechniquesUI = UiTechniques.Where(t => t.Enabled).Select(t => t.Id).Concat(Preset.TechniquesUI.Where(Pending)).Distinct().ToList();
         // the UI order only matters once something there was turned on
         Preset.TechniqueSortingUI = Preset.TechniquesUI.Count == 0 && Preset.TechniqueSortingUI.Count == 0
@@ -407,7 +407,6 @@ public sealed class Runtime
         foreach (TechniqueEntry t in Techniques)
         {
             t.Enabled = Preset.Techniques.Contains(t.Id);
-            t.Whole = Preset.TechniquesScreen.Contains(t.Id);
         }
         foreach (TechniqueEntry t in UiTechniques)
         {
@@ -499,6 +498,8 @@ public sealed class Settings
     public int OverlayKey = 268;      // GLFW Home
     public int ScreenshotKey = 283;   // GLFW PrintScreen
     public bool SaveBeforeAndAfter = true;
+    // the UI tab is for people who want it, off by default
+    public bool ShowUiTab;
     public string ScreenshotPath;
     public string PresetPath;
     public List<string> GlobalDefinitions = new();
@@ -528,6 +529,7 @@ public sealed class Settings
                 case "KeyOverlay": int.TryParse(value, out s.OverlayKey); break;
                 case "KeyScreenshot": int.TryParse(value, out s.ScreenshotKey); break;
                 case "SaveBeforeShot": s.SaveBeforeAndAfter = value == "1"; break;
+                case "ShowUiTab": s.ShowUiTab = value == "1"; break;
                 case "SavePath": s.ScreenshotPath = ReShadeMod.FromStored(value); break;
                 case "PresetPath": s.PresetPath = ReShadeMod.FromStored(value); break;
                 case "PreprocessorDefinitions": s.GlobalDefinitions = value.Split(',').Select(v => v.Trim()).Where(v => v.Length > 0).ToList(); break;
@@ -551,7 +553,10 @@ public sealed class Settings
             "",
             "[SCREENSHOT]",
             "SavePath=" + ReShadeMod.ToStored(ScreenshotPath),
-            "SaveBeforeShot=" + (SaveBeforeAndAfter ? "1" : "0")
+            "SaveBeforeShot=" + (SaveBeforeAndAfter ? "1" : "0"),
+            "",
+            "[OVERLAY]",
+            "ShowUiTab=" + (ShowUiTab ? "1" : "0")
         });
     }
 }

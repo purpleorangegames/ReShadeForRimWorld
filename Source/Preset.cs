@@ -15,10 +15,10 @@ public sealed class Preset
     public List<string> Techniques = new();        // "Name@File.fx", enabled ones
     public List<string> TechniqueSorting = new();  // "Name@File.fx", full order
     public List<string> Definitions = new();       // "NAME=VALUE"
-    // our own keys, ReShade ignores them: the UI tab's list and the Game techniques that run on the whole screen
+    // our own keys, ReShade ignores them: the UI tab's list, and whether the Game list also changes the UI
     public List<string> TechniquesUI = new();
     public List<string> TechniqueSortingUI = new();
-    public List<string> TechniquesScreen = new();
+    public bool GameChangesUI;
     public Dictionary<string, Dictionary<string, float[]>> Values = new(StringComparer.OrdinalIgnoreCase);
 
     public static Preset Load(string path)
@@ -67,8 +67,8 @@ public sealed class Preset
                     case "TechniqueSortingUI":
                         preset.TechniqueSortingUI = SplitList(value);
                         break;
-                    case "TechniquesScreen":
-                        preset.TechniquesScreen = SplitList(value);
+                    case "GameChangesUI":
+                        preset.GameChangesUI = value == "1";
                         break;
                 }
                 continue;
@@ -93,11 +93,14 @@ public sealed class Preset
         sb.Append("PreprocessorDefinitions=").Append(string.Join(",", Definitions)).Append('\n');
         sb.Append("Techniques=").Append(string.Join(",", Techniques)).Append('\n');
         sb.Append("TechniqueSorting=").Append(string.Join(",", TechniqueSorting)).Append('\n');
-        if (TechniquesUI.Count > 0 || TechniquesScreen.Count > 0 || TechniqueSortingUI.Count > 0)
+        if (GameChangesUI)
+        {
+            sb.Append("GameChangesUI=1\n");
+        }
+        if (TechniquesUI.Count > 0 || TechniqueSortingUI.Count > 0)
         {
             sb.Append("TechniquesUI=").Append(string.Join(",", TechniquesUI)).Append('\n');
             sb.Append("TechniqueSortingUI=").Append(string.Join(",", TechniqueSortingUI)).Append('\n');
-            sb.Append("TechniquesScreen=").Append(string.Join(",", TechniquesScreen)).Append('\n');
         }
         foreach (var section in Values.OrderBy(s => s.Key, StringComparer.OrdinalIgnoreCase))
         {

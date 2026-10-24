@@ -10,7 +10,7 @@ All thanks to ReShade: https://github.com/crosire/reshade
 
 Press Home in game to open the overlay. From there you can turn effects on and off, change their order and settings, edit the shaders and download shader packages from the same list ReShade uses. PrintScreen saves a screenshot.
 
-The Game tab changes the map only, the UI stays as it is. Tick +UI next to an effect to have it change the UI too. The UI tab has its own effects that only change the UI.
+Effects change the map only, the UI stays as it is. Tick "Game effects also change the UI" to have them change the UI too, like ReShade does. There is also a UI tab with effects that only change the UI, turn it on in Settings.
 
 Shaders, presets and screenshots go in the RimWorld save folder, in ReShade. You can also copy your own shaders into ReShade/reshade-shaders/Shaders.
 

@@ -216,8 +216,14 @@ void main()
     public IReadOnlyList<IRenderPass> Passes => passes;
     public IList<string> TexturePaths = new List<string>();
 
-    public LayerFeature()
+    // the map's render target, for its depth: whole screen effects get the same depth the map effects get
+    private readonly Func<int, RenderTexture> scene;
+    private readonly Func<bool> sceneActive;
+
+    public LayerFeature(Func<int, RenderTexture> scene, Func<bool> sceneActive)
     {
+        this.scene = scene;
+        this.sceneActive = sceneActive;
         passes = new IRenderPass[] { this };
     }
 
@@ -353,12 +359,33 @@ void main()
 
             // whole screen techniques see the map and the UI together
             var screenIo = new FrameTargets { BackBuffer = final, BackBufferCopy = finalCopy, StandIn = standIn, StandIn1D = standIn1D, StandIn3D = standIn3D };
-            foreach (RenderItem item in screenList)
+            RenderTexture depthSource = null;
+            if (screenList.Length > 0 && sceneActive())
             {
-                if (item.Effect.Prepare(in ctx, in frame.Data, in screenIo, TexturePaths, Say))
+                RenderTexture sceneRt = scene(ctx.SubmissionFrameIndex);
+                if (sceneRt != null && sceneRt.HasDepth && sceneRt.Width == final.Width && sceneRt.Height == final.Height)
                 {
-                    builtEffects.Add(item.Effect);
-                    item.Effect.RecordTechnique(in ctx, in screenIo, item.Technique);
+                    depthSource = sceneRt;
+                    screenIo.Depth = sceneRt.DepthSampleView;
+                    GpuUtil.DepthToRead(cmd, sceneRt.Depth.Image, sceneRt.DepthFormat, true);
+                }
+            }
+            try
+            {
+                foreach (RenderItem item in screenList)
+                {
+                    if (item.Effect.Prepare(in ctx, in frame.Data, in screenIo, TexturePaths, Say))
+                    {
+                        builtEffects.Add(item.Effect);
+                        item.Effect.RecordTechnique(in ctx, in screenIo, item.Technique);
+                    }
+                }
+            }
+            finally
+            {
+                if (depthSource != null)
+                {
+                    GpuUtil.DepthToRead(cmd, depthSource.Depth.Image, depthSource.DepthFormat, false);
                 }
             }
 

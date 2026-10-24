@@ -101,7 +101,7 @@ public static class Overlay
                     DrawTechniques(rt, rt.Techniques, game: true);
                     ImGui.EndTabItem();
                 }
-                if (ImGui.BeginTabItem("UI", TabFlags("UI")))
+                if (rt.Settings.ShowUiTab && ImGui.BeginTabItem("UI", TabFlags("UI")))
                 {
                     DrawTechniques(rt, rt.UiTechniques, game: false);
                     ImGui.EndTabItem();
@@ -216,7 +216,9 @@ public static class Overlay
         int techniques = rt.Techniques.Count(t => !t.Hidden);
         int gameOn = rt.Techniques.Count(t => t.Enabled);
         int uiOn = rt.UiTechniques.Count(t => t.Enabled);
-        ImGui.Text($"{rt.Effects.Count} effects, {techniques} techniques, {gameOn} on in Game, {uiOn} on in UI");
+        ImGui.Text(rt.Settings.ShowUiTab
+            ? $"{rt.Effects.Count} effects, {techniques} techniques, {gameOn} on in Game, {uiOn} on in UI"
+            : $"{rt.Effects.Count} effects, {techniques} techniques, {gameOn} enabled");
         if (failedCount > 0)
         {
             ImGui.SameLine();
@@ -238,9 +240,22 @@ public static class Overlay
     // Game: effects on the map (or the whole screen with +UI). UI: effects on the UI layer only.
     private static void DrawTechniques(Runtime rt, List<TechniqueEntry> list, bool game)
     {
+        if (game && rt.Layers != null)
+        {
+            bool whole = rt.Preset.GameChangesUI;
+            if (ImGui.Checkbox("Game effects also change the UI", ref whole))
+            {
+                rt.Preset.GameChangesUI = whole;
+                rt.Publish();
+            }
+            if (ImGui.IsItemHovered())
+            {
+                ImGui.SetTooltip("Off: only the map changes. On: the whole list runs on the map and the UI together, like ReShade does.");
+            }
+        }
         if (!game)
         {
-            ImGui.TextWrapped("Effects here only change the UI, the map stays as it is. To run an effect on the map and the UI together, tick +UI next to it in the Game tab.");
+            ImGui.TextWrapped("Effects here only change the UI, the map stays as it is.");
             if (rt.Layers == null || UiCapture.Broken)
             {
                 ImGui.TextColored(red, "UI layers are off, see the log for why.");
@@ -283,20 +298,6 @@ public static class Overlay
                     rt.Publish();
                 }
                 ImGui.SameLine();
-                if (game)
-                {
-                    bool whole = t.Whole;
-                    if (ImGui.Checkbox("+UI##whole", ref whole))
-                    {
-                        t.Whole = whole;
-                        rt.Publish();
-                    }
-                    if (ImGui.IsItemHovered())
-                    {
-                        ImGui.SetTooltip("Also change the UI: runs on the whole screen, after the UI is drawn");
-                    }
-                    ImGui.SameLine();
-                }
                 ImGui.Selectable($"{t.Label}  [{t.Effect.Name}]", false);
                 if (t.Tooltip != null && ImGui.IsItemHovered())
                 {
@@ -738,6 +739,15 @@ public static class Overlay
         }
         ImGui.SameLine();
         ImGui.Text("Screenshot key");
+
+        ImGui.SeparatorText("Overlay");
+        bool showUi = s.ShowUiTab;
+        if (ImGui.Checkbox("Show the UI tab (effects that only change the UI)", ref showUi))
+        {
+            s.ShowUiTab = showUi;
+            s.Save();
+            rt.Publish();
+        }
 
         ImGui.SeparatorText("Screenshots");
         if (screenshotPath.Length == 0)
