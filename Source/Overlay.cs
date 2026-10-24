@@ -261,7 +261,18 @@ public static class Overlay
                 ImGui.TextColored(red, "UI layers are off, see the log for why.");
             }
         }
+        ImGui.PushItemWidth(-110);
         ImGui.InputTextWithHint("##filter", "Search techniques", filter.Buffer);
+        ImGui.PopItemWidth();
+        ImGui.SameLine();
+        if (ImGui.Button("Active to top"))
+        {
+            // enabled ones first, each group keeps its order, so the chain runs the same
+            var sorted = list.Where(t => t.Enabled).Concat(list.Where(t => !t.Enabled)).ToList();
+            list.Clear();
+            list.AddRange(sorted);
+            rt.Publish();
+        }
         filter.EvaluateLength();
         string search = filter.ToString().Trim();
 
@@ -296,9 +307,16 @@ public static class Overlay
                 {
                     t.Enabled = enabled;
                     rt.Publish();
+                    if (enabled)
+                    {
+                        Select(t);
+                    }
                 }
                 ImGui.SameLine();
-                ImGui.Selectable($"{t.Label}  [{t.Effect.Name}]", false);
+                if (ImGui.Selectable($"{t.Label}  [{t.Effect.Name}]", selectedId == t.Id && selectedEffect == t.Effect))
+                {
+                    Select(t);
+                }
                 if (t.Tooltip != null && ImGui.IsItemHovered())
                 {
                     ImGui.SetTooltip(t.Tooltip);
@@ -360,6 +378,11 @@ public static class Overlay
         if (ImGui.BeginChild("##variables", new float2 { X = 0, Y = 0 }, ImGuiChildFlags.Borders))
         {
             var effects = list.Where(t => t.Enabled).Select(t => t.Effect).Distinct().ToList();
+            // a technique that is off has no settings shown, nothing to jump to
+            if (scrollToSelected && !effects.Contains(selectedEffect))
+            {
+                scrollToSelected = false;
+            }
             foreach (Effect e in effects)
             {
                 if (!rt.Listed.TryGetValue(e.Source ?? e, out var result) || result.Module == null)
@@ -372,7 +395,18 @@ public static class Overlay
                     continue;
                 }
                 ImGui.PushID(e.FilePath);
-                if (ImGui.CollapsingHeader(e.Name, ImGuiTreeNodeFlags.DefaultOpen))
+                bool jump = scrollToSelected && e == selectedEffect;
+                if (jump)
+                {
+                    ImGui.SetNextItemOpen(true);
+                }
+                bool open = ImGui.CollapsingHeader(e.Name, ImGuiTreeNodeFlags.DefaultOpen);
+                if (jump)
+                {
+                    ImGui.SetScrollHereY(0f);
+                    scrollToSelected = false;
+                }
+                if (open)
                 {
                     string category = null;
                     foreach (FxUniform u in uniforms)
@@ -406,6 +440,18 @@ public static class Overlay
             }
         }
         ImGui.EndChild();
+    }
+
+    // the technique last clicked or turned on; its settings get scrolled into view once
+    private static Effect selectedEffect;
+    private static string selectedId;
+    private static bool scrollToSelected;
+
+    private static void Select(TechniqueEntry t)
+    {
+        selectedEffect = t.Effect;
+        selectedId = t.Id;
+        scrollToSelected = true;
     }
 
     private static bool packagesRequested;
