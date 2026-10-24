@@ -62,6 +62,51 @@ public class ReShadeMod : Mod
         LongEventHandler.ExecuteWhenFinished(Install);
     }
 
+    public override string SettingsCategory() => "ReShade for RimWorld";
+
+    // the keys can also be set here, with the game's own UI, so a key another mod uses can't lock anyone out
+    public override void DoSettingsWindowContents(UnityEngine.Rect inRect)
+    {
+        var list = new Listing_Standard();
+        list.Begin(inRect);
+        if (Runtime == null)
+        {
+            list.Label("The effects could not start, see the log.");
+            list.End();
+            return;
+        }
+        Settings s = Runtime.Settings;
+        list.Label("Overlay key: " + Overlay.KeyName(s.OverlayKey));
+        if (list.ButtonText(Overlay.WaitingForKey == 1 ? "Press a key... (Esc cancels)" : "Change overlay key"))
+        {
+            Overlay.WaitingForKey = 1;
+        }
+        list.Gap();
+        list.Label("Screenshot key: " + Overlay.KeyName(s.ScreenshotKey));
+        if (list.ButtonText(Overlay.WaitingForKey == 2 ? "Press a key... (Esc cancels)" : "Change screenshot key"))
+        {
+            Overlay.WaitingForKey = 2;
+        }
+        if (list.ButtonText("Clear screenshot key"))
+        {
+            s.ScreenshotKey = 0;
+            s.Save();
+        }
+        list.Gap();
+        if (list.ButtonText("Reset keys to defaults (F2, no screenshot key)"))
+        {
+            s.OverlayKey = 291;
+            s.ScreenshotKey = 0;
+            s.Save();
+        }
+        list.Gap();
+        if (list.ButtonText("Open the overlay"))
+        {
+            Overlay.Open = true;
+        }
+        list.End();
+    }
+
     private static void Install()
     {
         try
