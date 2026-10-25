@@ -30,7 +30,8 @@ public static unsafe class NativeFx
         return NativeLibrary.Load(Path.Combine(NativeDir, file));
     }
 
-    [DllImport(Lib)] private static extern IntPtr rfx_compile(byte* path, byte** includePaths, int includeCount, byte** defines, int defineCount);
+    [DllImport(Lib)] private static extern IntPtr rfx_compile2(byte* path, byte** includePaths, int includeCount, byte** defines, int defineCount, int performanceMode);
+    [DllImport(Lib)] private static extern IntPtr rfx_included_files(IntPtr r);
     [DllImport(Lib)] private static extern int rfx_success(IntPtr r);
     [DllImport(Lib)] private static extern IntPtr rfx_errors(IntPtr r);
     [DllImport(Lib)] private static extern IntPtr rfx_module_json(IntPtr r);
@@ -43,9 +44,12 @@ public static unsafe class NativeFx
         public string Errors;
         public string ModuleJson;
         public Dictionary<string, byte[]> Spirv = new();
+        // every file the preprocessor opened besides the effect itself
+        public List<string> Included = new();
     }
 
-    public static Result Compile(string path, IList<string> includePaths, IList<string> defines, IEnumerable<string> entryPoints = null)
+    // entryPoints gets the parsed module JSON and names the entry points to fetch SPIR-V for
+    public static Result Compile(string path, IList<string> includePaths, IList<string> defines, bool performanceMode, Func<string, IEnumerable<string>> entryPoints)
     {
         var handles = new List<GCHandle>();
         byte* Pin(string s)
@@ -67,7 +71,7 @@ public static unsafe class NativeFx
             {
                 defs[i] = Pin(defines[i]);
             }
-            IntPtr r = rfx_compile(Pin(path), inc, includePaths.Count, defs, defines.Count);
+            IntPtr r = rfx_compile2(Pin(path), inc, includePaths.Count, defs, defines.Count, performanceMode ? 1 : 0);
             try
             {
                 var result = new Result
@@ -76,9 +80,13 @@ public static unsafe class NativeFx
                     Errors = Marshal.PtrToStringUTF8(rfx_errors(r)) ?? "",
                     ModuleJson = Marshal.PtrToStringUTF8(rfx_module_json(r)) ?? ""
                 };
-                if (result.Success && entryPoints != null)
+                foreach (string file in (Marshal.PtrToStringUTF8(rfx_included_files(r)) ?? "").Split('\n', StringSplitOptions.RemoveEmptyEntries))
                 {
-                    foreach (string entry in entryPoints)
+                    result.Included.Add(file);
+                }
+                if (result.Success)
+                {
+                    foreach (string entry in entryPoints(result.ModuleJson))
                     {
                         if (rfx_entry_spirv(r, Pin(entry), out IntPtr data, out nuint size) != 0)
                         {

@@ -22,14 +22,18 @@ public struct FrameData
     public float Year, Month, Day, Seconds;
 }
 
-// what an effect reads and writes besides its own textures, for one frame
-public struct FrameTargets
+// what an effect reads and writes besides its own textures, for one frame.
+// The back buffer ping-pongs between A and B: a pass reads Current and draws into the other one.
+// Current can also start out as an image that isn't ours (the scene), that one is only ever read.
+public sealed class FrameTargets
 {
-    public FxTexture BackBuffer;
-    public FxTexture BackBufferCopy;
+    public FxTexture A, B;
+    public FxTexture Current;
     public FxTexture StandIn;
     public FxTexture StandIn1D, StandIn3D;
     public VkImageView Depth;
+    public bool HasDepth;
+    public FxTexture Spare => Current == A ? B : A;
 }
 
 // one .fx file: compiled module plus all the GPU objects needed to run its techniques
@@ -47,6 +51,12 @@ public sealed unsafe class Effect : IDisposable
         public Dictionary<string, byte[]> Spirv;
         public int Width, Height;
         public string Defines;
+        public bool PerformanceMode;
+        public List<string> Included = new();
+        // some pass samples the depth buffer, so the scene's depth has to be made readable
+        public bool UsesDepth;
+        // some pass samples the back buffer through an sRGB view, which the game's scene image doesn't have
+        public bool ReadsColorAsSrgb;
     }
 
     // a layer copy (UI layer, whole screen) shares its source's compile and may share its values,
@@ -102,20 +112,55 @@ public sealed unsafe class Effect : IDisposable
     private int uniformStride;
     private byte[] uniformData = Array.Empty<byte>();
     private readonly List<PassGpu> passes = new();
+    private readonly Dictionary<string, PassGpu[]> techniquePasses = new();
     private FxTexture stencil;
+    // uniforms ReShade fills in ("timer", "random", ...) and the ones set from the overlay, sorted out once per build
+    private SourceUniform[] sourceUniforms = Array.Empty<SourceUniform>();
+    private FxUniform[] valueUniforms = Array.Empty<FxUniform>();
+    // performance mode: the variables' values as specialization constants, and the values they came from
+    private uint[] specData = Array.Empty<uint>();
+    private Dictionary<string, float[]> specFrom;
+
+    private enum UniformSource : byte { Timer, FrameTime, FrameCount, Random, Date, DepthReady, OverlayOpen, Other }
+
+    private struct SourceUniform
+    {
+        public FxUniform U;
+        public UniformSource Kind;
+        public int Min, Max;
+    }
+
+    private enum SlotKind : byte { BackBuffer, Depth, Own, StandIn }
+
+    // one sampler binding of a pass, worked out at build time
+    private struct SamplerSlot
+    {
+        public int Binding;
+        public VkSampler Sampler;
+        public SlotKind Kind;
+        public bool Srgb;
+        public FxTexture Own;
+        public FxTextureInfo Info;
+    }
 
     private sealed class PassGpu
     {
         public string Technique;
         public FxPass Pass;
-        public VkRenderPass LoadPass, ClearPass;
+        public VkRenderPass LoadPass, ClearPass, DontCarePass;
         public VkFramebuffer Framebuffer;
+        // passes drawing on the back buffer get one framebuffer for each of the two ping-pong textures
+        public VkFramebuffer FramebufferA, FramebufferB;
         public VkPipeline Pipeline;
         public VkShaderModule Vs, Ps;
         public FxTexture[] Targets;
         public bool ToBackBuffer;
         public bool UsesStencil, ClearsStencil;
+        // some pixels are left as they were (blending, a write mask, discard, a smaller viewport...),
+        // so the target has to hold the old image; otherwise it is drawn over completely
+        public bool KeepsContent;
         public int Width, Height;
+        public SamplerSlot[] Slots = Array.Empty<SamplerSlot>();
         // compute passes
         public bool IsCompute;
         public VkShaderModule Cs;
@@ -148,15 +193,15 @@ public sealed unsafe class Effect : IDisposable
         }
     }
 
-    // any thread: preprocesses and compiles the file with ReShade's compiler
-    public static CompileResult Compile(string filePath, int width, int height, IList<string> includePaths, IList<string> userDefines)
+    // any thread: preprocesses and compiles the file with ReShade's compiler, or takes it from the cache
+    public static CompileResult Compile(string filePath, int width, int height, IList<string> includePaths, IList<string> userDefines, string defineKey, bool performanceMode)
     {
-        var result = new CompileResult { Width = width, Height = height, Defines = string.Join("\n", userDefines) };
+        var result = new CompileResult { Width = width, Height = height, Defines = defineKey, PerformanceMode = performanceMode };
         var defines = new List<string>
         {
             "__RESHADE__=60500",
             "__RESHADE_PERMUTATION__=0",
-            "__RESHADE_PERFORMANCE_MODE__=0",
+            "__RESHADE_PERFORMANCE_MODE__=" + (performanceMode ? "1" : "0"),
             "__VENDOR__=0",
             "__DEVICE__=0",
             "__RENDERER__=0x20000",
@@ -170,22 +215,65 @@ public sealed unsafe class Effect : IDisposable
             "BUFFER_COLOR_BIT_DEPTH=8"
         };
         defines.AddRange(userDefines);
-        var first = NativeFx.Compile(filePath, includePaths, defines);
-        if (!first.Success)
+        if (CompileCache.TryLoad(filePath, width, height, defineKey, performanceMode, out string cachedJson, out var cachedSpirv, out var cachedIncluded, out string cachedErrors))
         {
-            result.Errors = string.IsNullOrEmpty(first.Errors) ? "unknown compile error" : first.Errors;
+            result.Module = FxModule.Parse(cachedJson);
+            result.Spirv = cachedSpirv;
+            result.Included = cachedIncluded;
+            result.Errors = cachedErrors;
+            result.Success = true;
+            result.UsesDepth = SamplesDepth(result.Module);
+            result.ReadsColorAsSrgb = SamplesColorAsSrgb(result.Module);
             return result;
         }
-        result.Module = FxModule.Parse(first.ModuleJson);
-        var second = NativeFx.Compile(filePath, includePaths, defines, result.Module.entry_points.Select(e => e.name));
-        result.Spirv = second.Spirv;
-        result.Errors = second.Errors ?? "";
-        result.Success = result.Module.entry_points.All(e => result.Spirv.ContainsKey(e.name));
+        FxModule module = null;
+        NativeFx.Result compiled = NativeFx.Compile(filePath, includePaths, defines, performanceMode, json =>
+        {
+            module = FxModule.Parse(json);
+            return module.entry_points.Select(e => e.name);
+        });
+        result.Included = compiled.Included;
+        if (!compiled.Success || module == null)
+        {
+            result.Errors = string.IsNullOrEmpty(compiled.Errors) ? "unknown compile error" : compiled.Errors;
+            return result;
+        }
+        result.Module = module;
+        result.Spirv = compiled.Spirv;
+        result.Errors = compiled.Errors ?? "";
+        result.Success = module.entry_points.All(e => result.Spirv.ContainsKey(e.name));
         if (!result.Success && result.Errors.Length == 0)
         {
             result.Errors = "missing SPIR-V for an entry point";
         }
+        if (result.Success)
+        {
+            result.UsesDepth = SamplesDepth(module);
+            result.ReadsColorAsSrgb = SamplesColorAsSrgb(module);
+            CompileCache.Save(filePath, width, height, defineKey, performanceMode, compiled.ModuleJson, result.Spirv, result.Included, result.Errors);
+        }
         return result;
+    }
+
+    // the compiler lists per pass the samplers its shaders really use
+    private static bool SamplesDepth(FxModule m) => AnySampler(m, (s, t) => t != null && IsDepth(t));
+
+    private static bool SamplesColorAsSrgb(FxModule m) => AnySampler(m, (s, t) => s.srgb && (t == null || IsBackBuffer(t)));
+
+    private static bool AnySampler(FxModule m, Func<FxSampler, FxTextureInfo, bool> test)
+    {
+        foreach (FxPass pass in m.techniques.SelectMany(t => t.passes))
+        {
+            foreach (FxBinding b in pass.sampler_bindings)
+            {
+                FxSampler s = m.samplers[b.index];
+                if (test(s, m.textures.FirstOrDefault(t => t.unique_name == s.texture_name)))
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     private static bool IsBackBuffer(FxTextureInfo t) => t.semantic == "COLOR" || t.semantic == "SV_TARGET";
@@ -193,16 +281,17 @@ public sealed unsafe class Effect : IDisposable
 
     private FxTextureInfo TextureByName(string uniqueName) => Module.textures.FirstOrDefault(t => t.unique_name == uniqueName);
 
-    private void Build(in FrameContext ctx, CompileResult result, FxTexture backBuffer, IList<string> texturePaths, Action<string> log)
+    private void Build(in FrameContext ctx, CompileResult result, FrameTargets io, IList<string> texturePaths, Action<string> log)
     {
         DestroyGpu();
         built = result;
         Module = result.Module;
         spirv = result.Spirv;
-        builtFor = backBuffer;
+        builtFor = io.A;
         graphicsDevice = ctx.GraphicsDevice;
         device = ctx.Device;
         int framesInFlight = ctx.RenderContext.FramesInFlight;
+        FxTexture backBuffer = io.A;
 
         foreach (FxTextureInfo t in Module.textures)
         {
@@ -268,6 +357,8 @@ public sealed unsafe class Effect : IDisposable
         }
 
         CreateUniformBuffer(framesInFlight);
+        specFrom = Values;
+        specData = SpecData(specFrom);
 
         foreach (FxTechnique technique in Module.techniques)
         {
@@ -284,12 +375,11 @@ public sealed unsafe class Effect : IDisposable
                         .Select(b => textures.TryGetValue(Module.storages[b.index].texture_name, out FxTexture st) ? st : null)
                         .Where(st => st != null).Distinct().ToArray();
                     gpu.Targets = gpu.StorageTargets;
+                    gpu.Slots = BuildSlots(pass, gpu.Targets);
                     passes.Add(gpu);
                     continue;
                 }
                 var names = pass.render_targets.Where(n => !string.IsNullOrEmpty(n)).ToList();
-                VkFormat[] formats;
-                VkImageView[] views;
                 if (names.Count == 0)
                 {
                     gpu.ToBackBuffer = true;
@@ -315,8 +405,7 @@ public sealed unsafe class Effect : IDisposable
                     }
                     gpu.Targets = targets.ToArray();
                 }
-                formats = gpu.Targets.Select(t => t.TargetFormat(pass.srgb_write_enable)).ToArray();
-                views = gpu.Targets.Select(t => t.TargetView(pass.srgb_write_enable)).ToArray();
+                VkFormat[] formats = gpu.Targets.Select(t => t.TargetFormat(pass.srgb_write_enable)).ToArray();
                 gpu.Width = gpu.Targets[0].Width;
                 gpu.Height = gpu.Targets[0].Height;
                 // ReShade's stencil buffer matches the back buffer, passes drawing at another size go without
@@ -326,7 +415,6 @@ public sealed unsafe class Effect : IDisposable
                     gpu.UsesStencil = true;
                     gpu.ClearsStencil = !stencilClearedInTechnique;
                     stencilClearedInTechnique = true;
-                    views = views.Append(stencil.View(false)).ToArray();
                 }
                 else if (pass.stencil_enable)
                 {
@@ -335,23 +423,184 @@ public sealed unsafe class Effect : IDisposable
                 VkFormat stencilFormat = gpu.UsesStencil ? stencil.Format : VkFormat.Undefined;
                 gpu.LoadPass = GpuUtil.CreateRenderPass(device, formats, clear: false, stencilFormat);
                 gpu.ClearPass = GpuUtil.CreateRenderPass(device, formats, clear: true, stencilFormat);
-                gpu.Framebuffer = GpuUtil.CreateFramebuffer(device, gpu.LoadPass, views, gpu.Width, gpu.Height);
+                gpu.DontCarePass = GpuUtil.CreateRenderPass(device, formats, clear: false, stencilFormat, dontCare: true);
+                VkImageView[] Views(FxTexture[] targets)
+                {
+                    var views = targets.Select(t => t.TargetView(pass.srgb_write_enable));
+                    return (gpu.UsesStencil ? views.Append(stencil.View(false)) : views).ToArray();
+                }
+                if (gpu.ToBackBuffer)
+                {
+                    gpu.FramebufferA = GpuUtil.CreateFramebuffer(device, gpu.LoadPass, Views(new[] { io.A }), gpu.Width, gpu.Height);
+                    gpu.FramebufferB = GpuUtil.CreateFramebuffer(device, gpu.LoadPass, Views(new[] { io.B }), gpu.Width, gpu.Height);
+                }
+                else
+                {
+                    gpu.Framebuffer = GpuUtil.CreateFramebuffer(device, gpu.LoadPass, Views(gpu.Targets), gpu.Width, gpu.Height);
+                }
                 gpu.Vs = RuntimeShaderCompiler.CreateShaderModule(device, spirv[pass.vs], Name + "." + pass.vs);
                 gpu.Ps = RuntimeShaderCompiler.CreateShaderModule(device, spirv[pass.ps], Name + "." + pass.ps);
                 gpu.Pipeline = CreatePipeline(gpu);
+                gpu.KeepsContent = KeepsContent(gpu, spirv[pass.ps]);
+                gpu.Slots = BuildSlots(pass, gpu.ToBackBuffer ? Array.Empty<FxTexture>() : gpu.Targets);
                 passes.Add(gpu);
             }
+        }
+        foreach (var group in passes.GroupBy(p => p.Technique))
+        {
+            techniquePasses[group.Key] = group.ToArray();
         }
 
         // defaults from the effect source, sources like "timer" get written every frame
         uniformData = new byte[Math.Max(16, (Module.total_uniform_size + 15) & ~15)];
+        var sources = new List<SourceUniform>();
+        var values = new List<FxUniform>();
         foreach (FxUniform u in Module.uniforms)
         {
             if (u.has_initializer)
             {
                 WriteConstant(u, u.initializer);
             }
+            string source = u.annotations.GetString("source");
+            if (source == null)
+            {
+                if (u.type.array_length == 0)
+                {
+                    values.Add(u);
+                }
+                continue;
+            }
+            sources.Add(new SourceUniform
+            {
+                U = u,
+                Kind = source switch
+                {
+                    "timer" => UniformSource.Timer,
+                    "frametime" => UniformSource.FrameTime,
+                    "framecount" => UniformSource.FrameCount,
+                    "random" => UniformSource.Random,
+                    "date" => UniformSource.Date,
+                    "bufready_depth" => UniformSource.DepthReady,
+                    "overlay_open" => UniformSource.OverlayOpen,
+                    _ => UniformSource.Other
+                },
+                Min = u.annotations.Find("min")?.value.i[0] ?? 0,
+                Max = u.annotations.Find("max")?.value.i[0] ?? 32767
+            });
         }
+        sourceUniforms = sources.Where(x => x.Kind != UniformSource.Other).ToArray();
+        valueUniforms = values.ToArray();
+    }
+
+    // what each sampler of the pass reads; a texture the pass draws to can't be read at the same time, ReShade unbinds it too
+    private SamplerSlot[] BuildSlots(FxPass pass, FxTexture[] targets)
+    {
+        var slots = new SamplerSlot[pass.sampler_bindings.Count];
+        for (int i = 0; i < slots.Length; i++)
+        {
+            FxBinding b = pass.sampler_bindings[i];
+            FxSampler s = Module.samplers[b.index];
+            FxTextureInfo tex = TextureByName(s.texture_name);
+            var slot = new SamplerSlot { Binding = b.binding, Sampler = samplers[b.index], Srgb = s.srgb, Info = tex };
+            if (tex == null || IsBackBuffer(tex))
+            {
+                slot.Kind = SlotKind.BackBuffer;
+            }
+            else if (IsDepth(tex))
+            {
+                slot.Kind = SlotKind.Depth;
+            }
+            else if (textures.TryGetValue(tex.unique_name, out FxTexture own) && Array.IndexOf(targets, own) < 0)
+            {
+                slot.Kind = SlotKind.Own;
+                slot.Own = own;
+            }
+            else
+            {
+                slot.Kind = SlotKind.StandIn;
+            }
+            slots[i] = slot;
+        }
+        return slots;
+    }
+
+    // true when the pass may leave pixels of its targets untouched, so it can't start from an undefined image
+    private static bool KeepsContent(PassGpu gpu, byte[] ps)
+    {
+        FxPass pass = gpu.Pass;
+        if (pass.clear_render_targets)
+        {
+            return false;
+        }
+        // with several targets the shader may not write all of them
+        if (gpu.UsesStencil || pass.stencil_enable || gpu.Targets.Length > 1)
+        {
+            return true;
+        }
+        if ((pass.viewport_width > 0 && pass.viewport_width != gpu.Width) || (pass.viewport_height > 0 && pass.viewport_height != gpu.Height))
+        {
+            return true;
+        }
+        // ReShade.fxh's full screen triangle; other vertex shaders may draw anywhere
+        if (pass.vs != "E__PostProcessVS" || pass.num_vertices != 3 || pass.topology != 4)
+        {
+            return true;
+        }
+        for (int i = 0; i < gpu.Targets.Length; i++)
+        {
+            FxBlend b = pass.blend[i];
+            if (b.enable || (b.write_mask & 0xF) != 0xF)
+            {
+                return true;
+            }
+        }
+        return Discards(ps);
+    }
+
+    // OpKill, OpTerminateInvocation or OpDemoteToHelperInvocation anywhere in the pixel shader
+    private static bool Discards(byte[] spv)
+    {
+        int words = spv.Length / 4;
+        for (int i = 5; i < words;)
+        {
+            uint w = BitConverter.ToUInt32(spv, i * 4);
+            uint op = w & 0xFFFF;
+            if (op == 252 || op == 4416 || op == 5380)
+            {
+                return true;
+            }
+            i += Math.Max(1, (int)(w >> 16));
+        }
+        return false;
+    }
+
+    // one 32 bit value per specialization constant, from the overlay's values or the effect's default
+    private uint[] SpecData(Dictionary<string, float[]> values)
+    {
+        List<FxUniform> constants = Module.spec_constants;
+        if (constants == null || constants.Count == 0)
+        {
+            return Array.Empty<uint>();
+        }
+        var data = new uint[constants.Count];
+        for (int i = 0; i < data.Length; i++)
+        {
+            FxUniform c = constants[i];
+            int baseType = c.type.base_;
+            if (c.type.array_length == 0 && values != null && values.TryGetValue(c.name, out float[] v) && c.offset < v.Length)
+            {
+                float x = v[c.offset];
+                data[i] = baseType == FxType.Float ? BitConverter.SingleToUInt32Bits(x)
+                    : baseType == FxType.Bool ? (x != 0 ? 1u : 0u)
+                    : baseType == FxType.Int ? unchecked((uint)(int)x)
+                    : (uint)x;
+            }
+            else
+            {
+                data[i] = baseType == FxType.Float ? BitConverter.SingleToUInt32Bits(c.initializer?.f?.FirstOrDefault() ?? 0f) : unchecked((uint)(c.initializer?.i?.FirstOrDefault() ?? 0));
+            }
+        }
+        return data;
     }
 
     private VkDescriptorSetLayout CreateLayout(VkDescriptorType type, int count)
@@ -429,11 +678,16 @@ public sealed unsafe class Effect : IDisposable
         FxPass pass = gpu.Pass;
         byte[] vsName = System.Text.Encoding.UTF8.GetBytes(pass.vs + "\0");
         byte[] psName = System.Text.Encoding.UTF8.GetBytes(pass.ps + "\0");
+        int specCount = specData.Length;
+        VkSpecializationMapEntry* specEntries = stackalloc VkSpecializationMapEntry[Math.Max(1, specCount)];
+        VkSpecializationInfo spec = Specialization(specEntries);
         fixed (byte* vsNamePtr = vsName, psNamePtr = psName)
+        fixed (uint* specValues = specData)
         {
+            spec.Data = specValues;
             VkPipelineShaderStageCreateInfo* stages = stackalloc VkPipelineShaderStageCreateInfo[2];
-            stages[0] = new VkPipelineShaderStageCreateInfo { Stage = VkShaderStageFlags.VertexBit, Module = gpu.Vs, Name = vsNamePtr };
-            stages[1] = new VkPipelineShaderStageCreateInfo { Stage = VkShaderStageFlags.FragmentBit, Module = gpu.Ps, Name = psNamePtr };
+            stages[0] = new VkPipelineShaderStageCreateInfo { Stage = VkShaderStageFlags.VertexBit, Module = gpu.Vs, Name = vsNamePtr, SpecializationInfo = specCount > 0 ? &spec : null };
+            stages[1] = new VkPipelineShaderStageCreateInfo { Stage = VkShaderStageFlags.FragmentBit, Module = gpu.Ps, Name = psNamePtr, SpecializationInfo = specCount > 0 ? &spec : null };
 
             var vertexInput = new VkPipelineVertexInputStateCreateInfo();
             var inputAssembly = new VkPipelineInputAssemblyStateCreateInfo();
@@ -524,10 +778,15 @@ public sealed unsafe class Effect : IDisposable
     private VkPipeline CreateComputePipeline(PassGpu gpu)
     {
         byte[] csName = System.Text.Encoding.UTF8.GetBytes(gpu.Pass.cs + "\0");
+        int specCount = specData.Length;
+        VkSpecializationMapEntry* specEntries = stackalloc VkSpecializationMapEntry[Math.Max(1, specCount)];
+        VkSpecializationInfo spec = Specialization(specEntries);
         fixed (byte* csNamePtr = csName)
+        fixed (uint* specValues = specData)
         {
+            spec.Data = specValues;
             var info = new VkComputePipelineCreateInfo();
-            info.Stage = new VkPipelineShaderStageCreateInfo { Stage = VkShaderStageFlags.ComputeBit, Module = gpu.Cs, Name = csNamePtr };
+            info.Stage = new VkPipelineShaderStageCreateInfo { Stage = VkShaderStageFlags.ComputeBit, Module = gpu.Cs, Name = csNamePtr, SpecializationInfo = specCount > 0 ? &spec : null };
             info.Layout = pipelineLayout;
             Span<VkPipeline> result = stackalloc VkPipeline[1];
             VkResult r = device.CreateComputePipelines(default(VkPipelineCache), new ReadOnlySpan<VkComputePipelineCreateInfo>(in info), device.VkAllocator, result);
@@ -536,6 +795,34 @@ public sealed unsafe class Effect : IDisposable
                 throw new InvalidOperationException($"{Name}: compute pipeline for pass {gpu.Pass.name} failed: {r}");
             }
             return result[0];
+        }
+    }
+
+    // SpecId i is the i-th specialization constant, one 32 bit value each (Data is set by the caller)
+    private VkSpecializationInfo Specialization(VkSpecializationMapEntry* entries)
+    {
+        for (int i = 0; i < specData.Length; i++)
+        {
+            entries[i] = new VkSpecializationMapEntry { ConstantID = i, Offset = ByteSize.Of(i * 4), Size = (ByteSize64)4 };
+        }
+        return new VkSpecializationInfo { MapEntryCount = specData.Length, MapEntries = entries, DataSize = (ByteSize64)(specData.Length * 4) };
+    }
+
+    // performance mode: new values mean new pipelines, the old ones go away once the GPU is done with them
+    private void RebuildPipelines()
+    {
+        DeviceEx d = device;
+        VkPipeline[] old = passes.Select(p => p.Pipeline).ToArray();
+        GpuGarbage.Add(() =>
+        {
+            foreach (VkPipeline p in old)
+            {
+                d.DestroyPipeline(p, d.VkAllocator);
+            }
+        });
+        foreach (PassGpu gpu in passes)
+        {
+            gpu.Pipeline = gpu.IsCompute ? CreateComputePipeline(gpu) : CreatePipeline(gpu);
         }
     }
 
@@ -569,82 +856,86 @@ public sealed unsafe class Effect : IDisposable
         }
     }
 
-    private void WriteScalars(FxUniform u, params float[] values)
+    private void WriteScalar(FxUniform u, int index, float value)
     {
-        for (int i = 0; i < values.Length && i * 4 + 4 <= u.size; i++)
+        int at = u.offset + index * 4;
+        if (index * 4 + 4 > u.size || at + 4 > uniformData.Length)
         {
-            if (u.type.base_ == FxType.Float)
-            {
-                MemoryMarshal.Write(uniformData.AsSpan(u.offset + i * 4), values[i]);
-            }
-            else if (u.type.base_ == FxType.Bool)
-            {
-                MemoryMarshal.Write(uniformData.AsSpan(u.offset + i * 4), values[i] != 0 ? 1 : 0);
-            }
-            else
-            {
-                MemoryMarshal.Write(uniformData.AsSpan(u.offset + i * 4), (int)values[i]);
-            }
+            return;
+        }
+        Span<byte> dst = uniformData.AsSpan(at);
+        if (u.type.base_ == FxType.Float)
+        {
+            MemoryMarshal.Write(dst, value);
+        }
+        else if (u.type.base_ == FxType.Bool)
+        {
+            MemoryMarshal.Write(dst, value != 0 ? 1 : 0);
+        }
+        else
+        {
+            MemoryMarshal.Write(dst, (int)value);
         }
     }
 
-    // the "source" annotation values ReShade fills in for effects
+    // the "source" annotation values ReShade fills in for effects, then the overlay's values
     private void UpdateSourceUniforms(in FrameData frame, bool hasDepth)
     {
         Dictionary<string, float[]> values = Values;
-        foreach (FxUniform u in Module.uniforms)
+        foreach (FxUniform u in valueUniforms)
         {
-            string source = u.annotations.GetString("source");
-            if (source == null)
+            if (values.TryGetValue(u.name, out float[] v))
             {
-                if (u.type.array_length == 0 && values.TryGetValue(u.name, out float[] v))
+                for (int i = 0; i < v.Length; i++)
                 {
-                    WriteScalars(u, v);
+                    WriteScalar(u, i, v[i]);
                 }
-                continue;
             }
-            switch (source)
+        }
+        foreach (SourceUniform x in sourceUniforms)
+        {
+            FxUniform u = x.U;
+            switch (x.Kind)
             {
-                case "timer":
-                    WriteScalars(u, frame.TimerMs);
+                case UniformSource.Timer:
+                    WriteScalar(u, 0, frame.TimerMs);
                     break;
-                case "frametime":
-                    WriteScalars(u, frame.FrameTimeMs);
+                case UniformSource.FrameTime:
+                    WriteScalar(u, 0, frame.FrameTimeMs);
                     break;
-                case "framecount":
-                    WriteScalars(u, frame.FrameCount);
+                case UniformSource.FrameCount:
+                    WriteScalar(u, 0, frame.FrameCount);
                     break;
-                case "random":
-                {
-                    int min = u.annotations.Find("min")?.value.i[0] ?? 0;
-                    int max = u.annotations.Find("max")?.value.i[0] ?? 32767;
-                    WriteScalars(u, min + (max > min ? frame.Random % (max - min + 1) : 0));
+                case UniformSource.Random:
+                    WriteScalar(u, 0, x.Min + (x.Max > x.Min ? frame.Random % (x.Max - x.Min + 1) : 0));
                     break;
-                }
-                case "date":
-                    WriteScalars(u, frame.Year, frame.Month, frame.Day, frame.Seconds);
+                case UniformSource.Date:
+                    WriteScalar(u, 0, frame.Year);
+                    WriteScalar(u, 1, frame.Month);
+                    WriteScalar(u, 2, frame.Day);
+                    WriteScalar(u, 3, frame.Seconds);
                     break;
-                case "bufready_depth":
-                    WriteScalars(u, hasDepth ? 1 : 0);
+                case UniformSource.DepthReady:
+                    WriteScalar(u, 0, hasDepth ? 1 : 0);
                     break;
-                case "overlay_open":
-                    WriteScalars(u, 0);
+                case UniformSource.OverlayOpen:
+                    WriteScalar(u, 0, 0);
                     break;
             }
         }
     }
 
     // render thread, once per frame before any of this effect's techniques: GPU objects, uploads, uniforms
-    public bool Prepare(in FrameContext ctx, in FrameData frame, in FrameTargets io, IList<string> texturePaths, Action<string> log)
+    public bool Prepare(in FrameContext ctx, in FrameData frame, FrameTargets io, IList<string> texturePaths, Action<string> log)
     {
         CompileResult result = Result;
         if (result == null || !result.Success)
         {
             return false;
         }
-        if (built != result || builtFor != io.BackBuffer)
+        if (built != result || builtFor != io.A)
         {
-            Build(in ctx, result, io.BackBuffer, texturePaths, log);
+            Build(in ctx, result, io, texturePaths, log);
         }
         if (preparedFrame == frame.FrameCount)
         {
@@ -653,6 +944,19 @@ public sealed unsafe class Effect : IDisposable
         preparedFrame = frame.FrameCount;
         CommandBuffer cmd = ctx.CommandBuffer;
         int frameIndex = ctx.SubmissionFrameIndex;
+
+        // values are replaced as a whole when one changes, so a different dictionary means something changed
+        Dictionary<string, float[]> current = Values;
+        if (specData.Length > 0 && current != specFrom)
+        {
+            specFrom = current;
+            uint[] data = SpecData(current);
+            if (!data.AsSpan().SequenceEqual(specData))
+            {
+                specData = data;
+                RebuildPipelines();
+            }
+        }
 
         foreach (FxTexture tex in textures.Values)
         {
@@ -667,8 +971,7 @@ public sealed unsafe class Effect : IDisposable
         }
         uploads.Clear();
 
-        bool hasDepth = !io.Depth.IsNull();
-        UpdateSourceUniforms(in frame, hasDepth);
+        UpdateSourceUniforms(in frame, io.HasDepth);
         new ReadOnlySpan<byte>(uniformData).CopyTo(new Span<byte>(uniformMapped + frameIndex * uniformStride, uniformStride));
 
         VkDescriptorPool pool = pools[frameIndex];
@@ -691,7 +994,7 @@ public sealed unsafe class Effect : IDisposable
     }
 
     // an empty texture of the same kind the shader declared, so 1D and 3D samplers stay valid
-    private static VkImageView StandInView(in FrameTargets io, FxTextureInfo t)
+    private static VkImageView StandInView(FrameTargets io, FxTextureInfo t)
     {
         FxTexture standIn = t?.type == 1 ? io.StandIn1D : t?.type == 3 ? io.StandIn3D : io.StandIn;
         return standIn.View(false);
@@ -700,71 +1003,58 @@ public sealed unsafe class Effect : IDisposable
     public bool HasTechnique(string name) => Module != null && Module.techniques.Any(t => t.name == name);
 
     // render thread, after Prepare
-    public void RecordTechnique(in FrameContext ctx, in FrameTargets io, string technique)
+    public void RecordTechnique(in FrameContext ctx, FrameTargets io, string technique)
     {
-        CommandBuffer cmd = ctx.CommandBuffer;
-        int frameIndex = ctx.SubmissionFrameIndex;
-        VkDescriptorPool pool = pools[frameIndex];
-        bool hasDepth = !io.Depth.IsNull();
-
-        foreach (PassGpu gpu in passes)
+        if (!techniquePasses.TryGetValue(technique, out PassGpu[] list))
         {
-            if (gpu.Technique != technique)
+            return;
+        }
+        CommandBuffer cmd = ctx.CommandBuffer;
+        VkDescriptorPool pool = pools[ctx.SubmissionFrameIndex];
+
+        foreach (PassGpu gpu in list)
+        {
+            // a pass drawing on the back buffer reads the current image and draws into the other one
+            FxTexture colorSource = io.Current;
+            FxTexture target = gpu.ToBackBuffer ? io.Spare : null;
+            if (gpu.ToBackBuffer && gpu.KeepsContent)
             {
-                continue;
-            }
-            FxTexture colorSource = io.BackBuffer;
-            if (gpu.ToBackBuffer)
-            {
-                // the pass draws onto the back buffer, so it reads a copy of it
-                GpuUtil.Copy(cmd, io.BackBuffer.Image, io.BackBufferCopy.Image, io.BackBuffer.Width, io.BackBuffer.Height);
-                colorSource = io.BackBufferCopy;
+                GpuUtil.Copy(cmd, colorSource.Image, target.Image, colorSource.Width, colorSource.Height);
             }
 
             VkDescriptorSet samplerSet = DescriptorSetWriter.AllocateDescriptorSet(device, pool, samplerLayout);
-            List<FxBinding> bindings = gpu.Pass.sampler_bindings;
-            int n = bindings.Count;
+            SamplerSlot[] slots = gpu.Slots;
+            int n = slots.Length;
             if (n > 0)
             {
                 VkDescriptorImageInfo* images = stackalloc VkDescriptorImageInfo[n];
                 VkWriteDescriptorSet* writes = stackalloc VkWriteDescriptorSet[n];
                 for (int i = 0; i < n; i++)
                 {
-                    int samplerIndex = bindings[i].index;
-                    FxSampler s = Module.samplers[samplerIndex];
-                    FxTextureInfo tex = TextureByName(s.texture_name);
+                    ref SamplerSlot slot = ref slots[i];
                     VkImageView view;
                     VkImageLayout layout = VkImageLayout.ShaderReadOnlyOptimal;
-                    if (tex == null || IsBackBuffer(tex))
+                    switch (slot.Kind)
                     {
-                        view = colorSource.View(s.srgb);
-                    }
-                    else if (IsDepth(tex))
-                    {
-                        if (hasDepth)
-                        {
+                        case SlotKind.BackBuffer:
+                            view = colorSource.View(slot.Srgb);
+                            break;
+                        case SlotKind.Depth when !io.Depth.IsNull():
                             view = io.Depth;
                             layout = VkImageLayout.DepthStencilReadOnlyOptimal;
-                        }
-                        else
-                        {
-                            view = StandInView(in io, tex);
-                        }
+                            break;
+                        case SlotKind.Own:
+                            view = slot.Own.View(slot.Srgb);
+                            break;
+                        default:
+                            view = StandInView(io, slot.Info);
+                            break;
                     }
-                    else if (textures.TryGetValue(tex.unique_name, out FxTexture own) && Array.IndexOf(gpu.Targets, own) < 0)
-                    {
-                        view = own.View(s.srgb);
-                    }
-                    else
-                    {
-                        // a texture can't be read while it is being drawn to, ReShade unbinds it too
-                        view = StandInView(in io, tex);
-                    }
-                    images[i] = new VkDescriptorImageInfo { Sampler = samplers[samplerIndex], ImageView = view, ImageLayout = layout };
+                    images[i] = new VkDescriptorImageInfo { Sampler = slot.Sampler, ImageView = view, ImageLayout = layout };
                     writes[i] = new VkWriteDescriptorSet
                     {
                         DstSet = samplerSet,
-                        DstBinding = bindings[i].binding,
+                        DstBinding = slot.Binding,
                         DescriptorCount = 1,
                         DescriptorType = VkDescriptorType.CombinedImageSampler,
                         ImageInfo = images + i
@@ -793,8 +1083,8 @@ public sealed unsafe class Effect : IDisposable
             }
             var begin = new VkRenderPassBeginInfo
             {
-                RenderPass = clear ? gpu.ClearPass : gpu.LoadPass,
-                Framebuffer = gpu.Framebuffer,
+                RenderPass = clear ? gpu.ClearPass : gpu.KeepsContent ? gpu.LoadPass : gpu.DontCarePass,
+                Framebuffer = !gpu.ToBackBuffer ? gpu.Framebuffer : target == io.A ? gpu.FramebufferA : gpu.FramebufferB,
                 RenderArea = new VkRect2D(new VkExtent2D(gpu.Width, gpu.Height)),
                 ClearValueCount = clear ? targetCount : 0,
                 ClearValues = clear ? clearValues : null
@@ -814,7 +1104,11 @@ public sealed unsafe class Effect : IDisposable
             cmd.Draw(Math.Max(1, pass.num_vertices), 1, 0, 0);
             cmd.EndRenderPass();
 
-            if (pass.generate_mipmaps)
+            if (gpu.ToBackBuffer)
+            {
+                io.Current = target;
+            }
+            else if (pass.generate_mipmaps)
             {
                 foreach (FxTexture t in gpu.Targets)
                 {
@@ -902,6 +1196,7 @@ public sealed unsafe class Effect : IDisposable
         stencil = null;
         PassGpu[] oldPasses = passes.ToArray();
         passes.Clear();
+        techniquePasses.Clear();
         VkSampler[] oldSamplers = samplers;
         samplers = Array.Empty<VkSampler>();
         VkDescriptorPool[] oldPools = pools;
@@ -927,9 +1222,16 @@ public sealed unsafe class Effect : IDisposable
                 }
                 d.DestroyShaderModule(p.Vs, d.VkAllocator);
                 d.DestroyShaderModule(p.Ps, d.VkAllocator);
-                d.DestroyFramebuffer(p.Framebuffer, d.VkAllocator);
+                foreach (VkFramebuffer fb in new[] { p.Framebuffer, p.FramebufferA, p.FramebufferB })
+                {
+                    if (!fb.IsNull())
+                    {
+                        d.DestroyFramebuffer(fb, d.VkAllocator);
+                    }
+                }
                 d.DestroyRenderPass(p.LoadPass, d.VkAllocator);
                 d.DestroyRenderPass(p.ClearPass, d.VkAllocator);
+                d.DestroyRenderPass(p.DontCarePass, d.VkAllocator);
             }
             foreach (VkSampler s in oldSamplers)
             {

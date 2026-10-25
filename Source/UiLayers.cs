@@ -4,7 +4,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Reflection;
-using System.Runtime.InteropServices;
+using System.Reflection.Emit;
 using Brutal.ImGuiApi;
 using Brutal.VulkanApi;
 using Brutal.VulkanApi.Abstractions;
@@ -15,105 +15,134 @@ using Waylith.Rendering;
 namespace ReShadeForRimWorld;
 
 // The game draws all its UI into ImGui's background draw list; every ImGui window belongs to our overlay.
-// When UI or whole screen techniques are on, the frame's draw lists get split in two snapshots and the
-// game's own UI pass is skipped, LayerFeature then draws them itself.
+// While whole screen or UI techniques are on, the game's snapshot copy of the frame's draw lists is
+// filtered: the game keeps its own lists and our overlay gets a snapshot of its own, drawn on top after
+// the effects. With UI techniques the game's UI pass is also skipped and LayerFeature draws the game's
+// snapshot itself, on a layer of its own.
 [HarmonyPatch]
 public static class UiCapture
 {
-    private static Type snapshotType;
-    private static MethodInfo copyFrom;
-    private static FieldInfo frameNumberField;
-    private static FieldInfo guiBackendField;
-    private static PropertyInfo materialDrawsProperty;
-    private static object[] overlaySnapshots = Array.Empty<object>();
-
-    // set on the main thread by the runtime when any UI or whole screen technique is on
+    // set on the main thread by the runtime: anything on the whole screen or the UI layer, and UI layer effects
     public static volatile bool Wanted;
+    public static volatile bool TakeOver;
     public static volatile bool Broken;
 
-    // the frame most recently split, read by LayerFeature.CaptureFrame right after
+    // the frame most recently copied, read by LayerFeature.CaptureFrame right after
     public static object LastGame, LastOverlay;
     public static int LastFrame = -1;
     private static readonly ConcurrentDictionary<int, bool> takenOver = new();
 
-    private static bool Init(object snapshot, object host)
+    private delegate void CopyFromFn(object snapshot, ImDrawDataPtr drawData, object materialDraws);
+    private static Type snapshotType;
+    private static CopyFromFn copyFrom;
+    private static Func<object, int> getFrame;
+    private static Action<object, int> setFrame;
+    private static object[] overlaySnapshots = Array.Empty<object>();
+
+    [ThreadStatic] private static bool inEndFrame, inOwnCopy;
+    private static readonly List<ImDrawListPtr> all = new(), game = new(), ours = new();
+    private static int totalVtx, totalIdx;
+    private static bool split;
+
+    [HarmonyPatch("RimWorldWaylith.Imgui.ImGuiHost", "EndFrame"), HarmonyPrefix]
+    public static void BeforeEndFrame() => inEndFrame = true;
+
+    [HarmonyPatch("RimWorldWaylith.Imgui.ImGuiHost", "EndFrame"), HarmonyPostfix]
+    public static void AfterEndFrame() => inEndFrame = false;
+
+    private static bool Init(object snapshot)
     {
         if (copyFrom != null)
         {
             return true;
         }
         snapshotType = snapshot.GetType();
-        copyFrom = snapshotType.GetMethods().First(m => m.Name == "CopyFrom" && m.GetParameters().Length == 2);
-        frameNumberField = snapshotType.GetField("FrameNumber");
-        guiBackendField = host.GetType().GetField("guiBackend", BindingFlags.Instance | BindingFlags.NonPublic);
-        object backend = guiBackendField?.GetValue(host);
-        materialDrawsProperty = backend?.GetType().GetProperty("MaterialDraws", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-        return copyFrom != null && frameNumberField != null && materialDrawsProperty != null;
+        MethodInfo method = snapshotType.GetMethods().First(m => m.Name == "CopyFrom" && m.GetParameters().Length == 2 && m.GetParameters()[0].ParameterType == typeof(ImDrawDataPtr));
+        FieldInfo frameNumber = snapshotType.GetField("FrameNumber");
+        if (frameNumber == null)
+        {
+            return false;
+        }
+        copyFrom = Fast.Call<CopyFromFn>(method);
+        getFrame = Fast.Getter<int>(frameNumber);
+        setFrame = Fast.Setter<int>(frameNumber);
+        return true;
     }
 
-    [HarmonyPatch("RimWorldWaylith.Imgui.ImGuiHost", "EndFrame"), HarmonyPostfix]
-    public static unsafe void EndFrame(object __instance, object snapshot)
+    // ImGuiDrawSnapshot.CopyFrom(ImDrawDataPtr, IReadOnlyList<ImGuiMaterialDraw>), called from ImGuiHost.EndFrame
+    public static MethodBase CopyFromTarget()
     {
-        if (!Wanted || Broken)
+        Type type = AccessTools.TypeByName("RimWorldWaylith.Imgui.ImGuiDrawSnapshot");
+        return type?.GetMethods().FirstOrDefault(m => m.Name == "CopyFrom" && m.GetParameters().Length == 2 && m.GetParameters()[0].ParameterType == typeof(ImDrawDataPtr));
+    }
+
+    private static unsafe bool StartsWith(byte* p, ReadOnlySpan<byte> prefix)
+    {
+        for (int i = 0; i < prefix.Length; i++)
+        {
+            if (p[i] != prefix[i])
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static unsafe bool IsGameList(ImDrawListPtr l)
+    {
+        byte* owner = (byte*)(nint)l._OwnerName.Pointer;
+        return owner == null || *owner == 0 || StartsWith(owner, "##Background"u8) || StartsWith(owner, "##Foreground"u8);
+    }
+
+    // points ImGui's draw data at a subset of its lists (resize first, the span only covers the current size)
+    private static void UseLists(ref ImDrawDataPtr drawData, List<ImDrawListPtr> subset, int vtx = -1, int idx = -1)
+    {
+        ref ImVector<ImDrawListPtr> lists = ref drawData.CmdLists;
+        lists.Count = subset.Count;
+        int v = 0, x = 0;
+        for (int i = 0; i < subset.Count; i++)
+        {
+            lists.Span[i] = subset[i];
+            v += subset[i].VtxBuffer.Count;
+            x += subset[i].IdxBuffer.Count;
+        }
+        drawData.CmdListsCount = subset.Count;
+        drawData.TotalVtxCount = vtx >= 0 ? vtx : v;
+        drawData.TotalIdxCount = idx >= 0 ? idx : x;
+    }
+
+    public static void BeforeCopy(object __instance, ImDrawDataPtr drawData)
+    {
+        split = false;
+        if (!inEndFrame || inOwnCopy || !Wanted || Broken)
         {
             return;
         }
         try
         {
-            if (!Init(snapshot, __instance))
+            if (!Init(__instance))
             {
                 Broken = true;
                 ReShadeMod.Runtime?.Feature.Say("[ReShade] UI layers are off, this game version draws its UI differently than expected");
                 return;
             }
-            object materialDraws = materialDrawsProperty.GetValue(guiBackendField.GetValue(__instance));
-            ImDrawDataPtr drawData = ImGui.GetDrawData();
-            ref ImVector<ImDrawListPtr> lists = ref drawData.CmdLists;
-            ImDrawListPtr[] all = lists.Span.ToArray();
-            var game = new List<ImDrawListPtr>();
-            var ours = new List<ImDrawListPtr>();
-            foreach (ImDrawListPtr l in all)
+            all.Clear();
+            game.Clear();
+            ours.Clear();
+            foreach (ImDrawListPtr l in drawData.CmdLists.Span)
             {
-                string owner = Marshal.PtrToStringUTF8((nint)l._OwnerName.Pointer) ?? "";
-                if (owner.Length == 0 || owner.StartsWith("##Background") || owner.StartsWith("##Foreground"))
-                {
-                    game.Add(l);
-                }
-                else
-                {
-                    ours.Add(l);
-                }
+                all.Add(l);
+                (IsGameList(l) ? game : ours).Add(l);
             }
-            int totalVtx = drawData.TotalVtxCount, totalIdx = drawData.TotalIdxCount;
-
-            int ring = Math.Max(4, overlaySnapshots.Length);
-            if (overlaySnapshots.Length == 0)
+            // with the overlay closed there is nothing of ours to take out
+            if (ours.Count == 0)
             {
-                overlaySnapshots = new object[8];
-                for (int i = 0; i < overlaySnapshots.Length; i++)
-                {
-                    overlaySnapshots[i] = Activator.CreateInstance(snapshotType, nonPublic: true);
-                }
+                return;
             }
-            int frame = (int)frameNumberField.GetValue(snapshot);
-            object overlay = overlaySnapshots[(frame % overlaySnapshots.Length + overlaySnapshots.Length) % overlaySnapshots.Length];
-
-            // the game snapshot only gets the game's lists, the overlay one only ours
-            CopyLists(ref drawData, game, snapshot, materialDraws);
-            CopyLists(ref drawData, ours, overlay, materialDraws);
-            frameNumberField.SetValue(overlay, frame);
-
-            // put ImGui's draw data back the way it was (growing the vector clears the new slots)
-            lists.Count = all.Length;
-            all.AsSpan().CopyTo(lists.Span);
-            drawData.CmdListsCount = all.Length;
-            drawData.TotalVtxCount = totalVtx;
-            drawData.TotalIdxCount = totalIdx;
-
-            LastGame = snapshot;
-            LastOverlay = overlay;
-            LastFrame = frame;
-            takenOver[frame] = true;
+            split = true;
+            totalVtx = drawData.TotalVtxCount;
+            totalIdx = drawData.TotalIdxCount;
+            UseLists(ref drawData, game);
         }
         catch (Exception e)
         {
@@ -122,38 +151,129 @@ public static class UiCapture
         }
     }
 
-    private static void CopyLists(ref ImDrawDataPtr drawData, List<ImDrawListPtr> subset, object target, object materialDraws)
+    public static void AfterCopy(object __instance, ImDrawDataPtr drawData, object materialDraws)
     {
-        ref ImVector<ImDrawListPtr> lists = ref drawData.CmdLists;
-        // resize first, the span only covers the current size
-        lists.Count = subset.Count;
-        int vtx = 0, idx = 0;
-        for (int i = 0; i < subset.Count; i++)
+        if (!inEndFrame || inOwnCopy || !Wanted || Broken || copyFrom == null)
         {
-            lists.Span[i] = subset[i];
-            vtx += subset[i].VtxBuffer.Count;
-            idx += subset[i].IdxBuffer.Count;
+            return;
         }
-        drawData.CmdListsCount = subset.Count;
-        drawData.TotalVtxCount = vtx;
-        drawData.TotalIdxCount = idx;
-        copyFrom.Invoke(target, new[] { (object)drawData, materialDraws });
+        try
+        {
+            int frame = getFrame(__instance);
+            object overlay = null;
+            if (split)
+            {
+                split = false;
+                if (overlaySnapshots.Length == 0)
+                {
+                    overlaySnapshots = new object[8];
+                    for (int i = 0; i < overlaySnapshots.Length; i++)
+                    {
+                        overlaySnapshots[i] = Activator.CreateInstance(snapshotType, nonPublic: true);
+                    }
+                }
+                overlay = overlaySnapshots[(frame % overlaySnapshots.Length + overlaySnapshots.Length) % overlaySnapshots.Length];
+                UseLists(ref drawData, ours);
+                inOwnCopy = true;
+                try
+                {
+                    copyFrom(overlay, drawData, materialDraws);
+                }
+                finally
+                {
+                    inOwnCopy = false;
+                }
+                setFrame(overlay, frame);
+                // put ImGui's draw data back the way it was
+                UseLists(ref drawData, all, totalVtx, totalIdx);
+            }
+            bool take = TakeOver;
+            LastGame = take ? __instance : null;
+            LastOverlay = overlay;
+            LastFrame = frame;
+            if (take)
+            {
+                takenOver[frame] = true;
+            }
+        }
+        catch (Exception e)
+        {
+            Broken = true;
+            ReShadeMod.Runtime?.Feature.Say("[ReShade] UI layers turned off, could not split the UI: " + e);
+        }
     }
 
     // the game's own UI pass, skipped for frames LayerFeature draws
     [HarmonyPatch("RimWorldWaylith.Imgui.ImGuiRenderFeature", "Record"), HarmonyPrefix]
     public static bool SkipGameUi(object featurePayload)
     {
-        if (featurePayload == null || frameNumberField == null || featurePayload.GetType() != snapshotType)
+        if (featurePayload == null || getFrame == null || takenOver.IsEmpty || featurePayload.GetType() != snapshotType)
         {
             return true;
         }
-        int frame = (int)frameNumberField.GetValue(featurePayload);
-        return !takenOver.TryRemove(frame, out _);
+        return !takenOver.TryRemove(getFrame(featurePayload), out _);
     }
 
     // a frame we took but could not draw (LayerFeature inactive) must not lose its UI next time
     public static void Forget(int frame) => takenOver.TryRemove(frame, out _);
+}
+
+[HarmonyPatch]
+public static class UiCaptureCopy
+{
+    public static MethodBase TargetMethod() => UiCapture.CopyFromTarget();
+    public static void Prefix(object __instance, ImDrawDataPtr drawData) => UiCapture.BeforeCopy(__instance, drawData);
+    public static void Postfix(object __instance, ImDrawDataPtr drawData, object materialDraws) => UiCapture.AfterCopy(__instance, drawData, materialDraws);
+}
+
+// typed delegates for the game's internal ImGui methods, so the frame's calls skip reflection
+public static class Fast
+{
+    public static T Call<T>(MethodInfo method) where T : Delegate
+    {
+        MethodInfo invoke = typeof(T).GetMethod("Invoke");
+        Type[] args = invoke.GetParameters().Select(p => p.ParameterType).ToArray();
+        var dm = new DynamicMethod("ReShade." + method.Name, invoke.ReturnType, args, typeof(Fast).Module, true);
+        ILGenerator il = dm.GetILGenerator();
+        ParameterInfo[] target = method.GetParameters();
+        il.Emit(OpCodes.Ldarg_0);
+        il.Emit(OpCodes.Castclass, method.DeclaringType);
+        for (int i = 0; i < target.Length; i++)
+        {
+            il.Emit(OpCodes.Ldarg_S, (byte)(i + 1));
+            Type want = target[i].ParameterType;
+            if (args[i + 1] == typeof(object) && want != typeof(object))
+            {
+                il.Emit(want.IsValueType ? OpCodes.Unbox_Any : OpCodes.Castclass, want);
+            }
+        }
+        il.Emit(OpCodes.Callvirt, method);
+        il.Emit(OpCodes.Ret);
+        return (T)dm.CreateDelegate(typeof(T));
+    }
+
+    public static Func<object, T> Getter<T>(FieldInfo field)
+    {
+        var dm = new DynamicMethod("ReShade.get_" + field.Name, typeof(T), new[] { typeof(object) }, typeof(Fast).Module, true);
+        ILGenerator il = dm.GetILGenerator();
+        il.Emit(OpCodes.Ldarg_0);
+        il.Emit(OpCodes.Castclass, field.DeclaringType);
+        il.Emit(OpCodes.Ldfld, field);
+        il.Emit(OpCodes.Ret);
+        return (Func<object, T>)dm.CreateDelegate(typeof(Func<object, T>));
+    }
+
+    public static Action<object, T> Setter<T>(FieldInfo field)
+    {
+        var dm = new DynamicMethod("ReShade.set_" + field.Name, null, new[] { typeof(object), typeof(T) }, typeof(Fast).Module, true);
+        ILGenerator il = dm.GetILGenerator();
+        il.Emit(OpCodes.Ldarg_0);
+        il.Emit(OpCodes.Castclass, field.DeclaringType);
+        il.Emit(OpCodes.Ldarg_1);
+        il.Emit(OpCodes.Stfld, field);
+        il.Emit(OpCodes.Ret);
+        return (Action<object, T>)dm.CreateDelegate(typeof(Action<object, T>));
+    }
 }
 
 public sealed class LayerFrame
@@ -163,7 +283,8 @@ public sealed class LayerFrame
     public int Frame;
 }
 
-// runs after the game's backbuffer pass: UI layer effects, blend over the map, whole screen effects, overlay on top
+// runs after the game's backbuffer pass. With UI techniques: the game's UI on its own layer, its effects, blended
+// over the map. Then whole screen effects, and our overlay on top.
 public sealed class LayerFeature : IRenderFeature, IPostBackbufferPass
 {
     private readonly IRenderPass[] passes;
@@ -173,14 +294,19 @@ public sealed class LayerFeature : IRenderFeature, IPostBackbufferPass
     private int frameCount;
 
     public volatile RenderItem[] UiList = Array.Empty<RenderItem>();
+    public readonly GpuTimer Timer = new();
     public volatile RenderItem[] ScreenList = Array.Empty<RenderItem>();
     private readonly HashSet<Effect> builtEffects = new();
+    private readonly HashSet<Effect> used = new();
 
     // render thread
     private FxTexture screen, uiRaw, uiFx, uiFxCopy, final, finalCopy, standIn, standIn1D, standIn3D;
+    private readonly FrameTargets uiIo = new(), screenIo = new();
+    private readonly FxTexture[] one = new FxTexture[1], three = new FxTexture[3];
     private VkRenderPass uiClearPass, finalLoadPass;
     private object uiRenderer, overlayRenderer;
-    private MethodInfo renderMethod;
+    private delegate void RenderFn(object renderer, object snapshot, ref FrameContext ctx);
+    private RenderFn render;
     private DeviceEx device;
     private bool warnedUsage;
     private readonly FullscreenPass unpremultiply = new("UiUnpremultiply", 1, @"#version 450
@@ -230,20 +356,28 @@ void main()
     // main thread, after the game's ImGui feature captured (and we split) this frame's UI
     public object CaptureFrame(in FrameTiming timing)
     {
-        if (!UiCapture.Wanted || UiCapture.Broken || UiCapture.LastGame == null)
+        object game = UiCapture.LastGame, overlay = UiCapture.LastOverlay;
+        UiCapture.LastGame = null;
+        UiCapture.LastOverlay = null;
+        if (UiCapture.Broken)
         {
-            if (UiCapture.LastFrame >= 0)
+            if (game != null)
             {
                 UiCapture.Forget(UiCapture.LastFrame);
             }
+            return null;
+        }
+        // a UI taken from the game or an overlay split off has to be drawn even if the lists just changed
+        if (game == null && overlay == null && !(UiCapture.Wanted && ScreenList.Length > 0))
+        {
             return null;
         }
         double now = clock.Elapsed.TotalMilliseconds;
         DateTime date = DateTime.Now;
         var frame = new LayerFrame
         {
-            Game = UiCapture.LastGame,
-            Overlay = UiCapture.LastOverlay,
+            Game = game,
+            Overlay = overlay,
             Frame = UiCapture.LastFrame,
             Data = new FrameData
             {
@@ -258,7 +392,6 @@ void main()
             }
         };
         lastFrameMs = now;
-        UiCapture.LastGame = null;
         return frame;
     }
 
@@ -273,7 +406,7 @@ void main()
     {
         Type type = typeof(Waylith.Rendering.PostFx.CompositePass).Assembly.GetType("RimWorldWaylith.Imgui.ImGuiVulkanRenderer")
             ?? AppDomain.CurrentDomain.GetAssemblies().Select(a => a.GetType("RimWorldWaylith.Imgui.ImGuiVulkanRenderer")).First(t => t != null);
-        renderMethod ??= type.GetMethod("Render");
+        render ??= Fast.Call<RenderFn>(type.GetMethod("Render"));
         int frames = ctx.RenderContext.FramesInFlight;
         return Activator.CreateInstance(type, ctx.GraphicsDevice, renderPass, 0, VkSampleCountFlags._1Bit, frames + 1, frames, 1024,
             ctx.GraphicsDevice.ShaderLayoutCache, new ShaderModuleCache(ctx.Device));
@@ -296,7 +429,7 @@ void main()
             cmd.BeginRenderPass(in begin, VkSubpassContents.Inline);
         }
         var uiCtx = new FrameContext(ctx.RenderContext, ctx.Resources, cmd, renderPass, target.Framebuffer(renderPass), target.Extent, VkSampleCountFlags._1Bit, target.Format, VkFormat.Undefined);
-        renderMethod.Invoke(renderer, new object[] { snapshot, uiCtx });
+        render(renderer, snapshot, ref uiCtx);
         cmd.EndRenderPass();
     }
 
@@ -322,64 +455,75 @@ void main()
             UiCapture.Broken = true;
             return;
         }
+        Timer.Begin(in ctx);
         try
         {
             EnsureTargets(in ctx);
-            foreach (FxTexture t in new[] { screen, uiRaw, uiFx, uiFxCopy, final, finalCopy, standIn, standIn1D, standIn3D })
-            {
-                if (t.Fresh)
-                {
-                    GpuUtil.ClearFresh(cmd, t);
-                }
-            }
+            ClearIfFresh(cmd, screen);
+            ClearIfFresh(cmd, uiRaw);
+            ClearIfFresh(cmd, uiFx);
+            ClearIfFresh(cmd, uiFxCopy);
+            ClearIfFresh(cmd, final);
+            ClearIfFresh(cmd, finalCopy);
+            ClearIfFresh(cmd, standIn);
+            ClearIfFresh(cmd, standIn1D);
+            ClearIfFresh(cmd, standIn3D);
 
-            // the screen as the game left it: the map with game effects, no UI
             ScreenBarrier(cmd, swapchain, presentLayout, VkImageLayout.TransferSrcOptimal);
-            GpuUtil.CopyFromTransferSrc(cmd, swapchain, screen.Image, screen.Width, screen.Height);
-
-            // the game's UI on its own transparent layer
-            uiRenderer ??= CreateRenderer(in ctx, uiClearPass);
-            DrawUi(uiRenderer, frame.Game, in ctx, uiClearPass, uiRaw, clear: true);
-
-            bool uiEffects = uiList.Length > 0;
-            if (uiEffects)
+            if (frame.Game != null)
             {
-                unpremultiply.Record(in ctx, uiFx, new[] { uiRaw }, 0);
-                var io = new FrameTargets { BackBuffer = uiFx, BackBufferCopy = uiFxCopy, StandIn = standIn, StandIn1D = standIn1D, StandIn3D = standIn3D };
-                foreach (RenderItem item in uiList)
+                // the screen as the game left it: the map with game effects, no UI
+                GpuUtil.CopyFromTransferSrc(cmd, swapchain, screen.Image, screen.Width, screen.Height);
+
+                // the game's UI on its own transparent layer
+                uiRenderer ??= CreateRenderer(in ctx, uiClearPass);
+                DrawUi(uiRenderer, frame.Game, in ctx, uiClearPass, uiRaw, clear: true);
+
+                FxTexture uiResult = uiRaw;
+                if (uiList.Length > 0)
                 {
-                    if (item.Effect.Prepare(in ctx, in frame.Data, in io, TexturePaths, Say))
-                    {
-                        builtEffects.Add(item.Effect);
-                        item.Effect.RecordTechnique(in ctx, in io, item.Technique);
-                    }
+                    one[0] = uiRaw;
+                    unpremultiply.Record(in ctx, uiFx, one, 0);
+                    Targets(uiIo, uiFx, uiFxCopy);
+                    RunList(in ctx, uiList, uiIo, in frame.Data);
+                    uiResult = uiIo.Current;
                 }
+                three[0] = screen;
+                three[1] = uiRaw;
+                three[2] = uiResult;
+                composite.Record(in ctx, final, three, uiList.Length > 0 ? 1 : 0);
             }
-            composite.Record(in ctx, final, new[] { screen, uiRaw, uiEffects ? uiFx : uiRaw }, uiEffects ? 1 : 0);
+            else
+            {
+                // the game drew its UI itself, the whole screen effects start from what is on the screen
+                GpuUtil.CopyFromTransferSrc(cmd, swapchain, final.Image, final.Width, final.Height);
+            }
 
             // whole screen techniques see the map and the UI together
-            var screenIo = new FrameTargets { BackBuffer = final, BackBufferCopy = finalCopy, StandIn = standIn, StandIn1D = standIn1D, StandIn3D = standIn3D };
+            Targets(screenIo, final, finalCopy);
             RenderTexture depthSource = null;
+            bool usesDepth = false;
+            foreach (RenderItem item in screenList)
+            {
+                usesDepth |= item.Effect.Result?.UsesDepth ?? false;
+            }
             if (screenList.Length > 0 && sceneActive())
             {
                 RenderTexture sceneRt = scene(ctx.SubmissionFrameIndex);
                 if (sceneRt != null && sceneRt.HasDepth && sceneRt.Width == final.Width && sceneRt.Height == final.Height)
                 {
-                    depthSource = sceneRt;
-                    screenIo.Depth = sceneRt.DepthSampleView;
-                    GpuUtil.DepthToRead(cmd, sceneRt.Depth.Image, sceneRt.DepthFormat, true);
+                    screenIo.HasDepth = true;
+                    if (usesDepth)
+                    {
+                        depthSource = sceneRt;
+                        screenIo.Depth = sceneRt.DepthSampleView;
+                        GpuUtil.DepthToRead(cmd, sceneRt.Depth.Image, sceneRt.DepthFormat, true);
+                    }
                 }
             }
             try
             {
-                foreach (RenderItem item in screenList)
-                {
-                    if (item.Effect.Prepare(in ctx, in frame.Data, in screenIo, TexturePaths, Say))
-                    {
-                        builtEffects.Add(item.Effect);
-                        item.Effect.RecordTechnique(in ctx, in screenIo, item.Technique);
-                    }
-                }
+                RunList(in ctx, screenList, screenIo, in frame.Data);
             }
             finally
             {
@@ -390,10 +534,14 @@ void main()
             }
 
             // our overlay goes on top untouched, like ReShade's own menu
-            overlayRenderer ??= CreateRenderer(in ctx, finalLoadPass);
-            DrawUi(overlayRenderer, frame.Overlay, in ctx, finalLoadPass, final, clear: false);
+            FxTexture result = screenIo.Current;
+            if (frame.Overlay != null)
+            {
+                overlayRenderer ??= CreateRenderer(in ctx, finalLoadPass);
+                DrawUi(overlayRenderer, frame.Overlay, in ctx, finalLoadPass, result, clear: false);
+            }
 
-            GpuUtil.CopyToTransferDst(cmd, final.Image, swapchain, final.Width, final.Height, VkImageLayout.TransferSrcOptimal);
+            GpuUtil.CopyToTransferDst(cmd, result.Image, swapchain, result.Width, result.Height, VkImageLayout.TransferSrcOptimal);
             ScreenBarrier(cmd, swapchain, VkImageLayout.TransferDstOptimal, presentLayout);
         }
         catch (Exception e)
@@ -401,6 +549,42 @@ void main()
             UiCapture.Broken = true;
             Say("[ReShade] UI layers turned off after an error: " + e);
             ScreenBarrier(cmd, swapchain, VkImageLayout.Undefined, presentLayout);
+        }
+        finally
+        {
+            Timer.End(in ctx);
+        }
+    }
+
+    private void Targets(FrameTargets io, FxTexture a, FxTexture b)
+    {
+        io.A = a;
+        io.B = b;
+        io.Current = a;
+        io.StandIn = standIn;
+        io.StandIn1D = standIn1D;
+        io.StandIn3D = standIn3D;
+        io.Depth = default;
+        io.HasDepth = false;
+    }
+
+    private void RunList(in FrameContext ctx, RenderItem[] list, FrameTargets io, in FrameData data)
+    {
+        foreach (RenderItem item in list)
+        {
+            if (item.Effect.Prepare(in ctx, in data, io, TexturePaths, Say))
+            {
+                builtEffects.Add(item.Effect);
+                item.Effect.RecordTechnique(in ctx, io, item.Technique);
+            }
+        }
+    }
+
+    private static void ClearIfFresh(CommandBuffer cmd, FxTexture t)
+    {
+        if (t.Fresh)
+        {
+            GpuUtil.ClearFresh(cmd, t);
         }
     }
 
@@ -461,7 +645,19 @@ void main()
         {
             return;
         }
-        var used = new HashSet<Effect>(a.Concat(b).Select(i => i.Effect));
+        used.Clear();
+        foreach (RenderItem item in a)
+        {
+            used.Add(item.Effect);
+        }
+        foreach (RenderItem item in b)
+        {
+            used.Add(item.Effect);
+        }
+        if (builtEffects.IsSubsetOf(used))
+        {
+            return;
+        }
         builtEffects.RemoveWhere(e =>
         {
             if (used.Contains(e))

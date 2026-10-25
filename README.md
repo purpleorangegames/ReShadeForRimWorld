@@ -16,7 +16,9 @@ Effects change the map only, the UI stays as it is. Tick "Game effects change bo
 
 RimWorld's own screenshot (F10) has the effects too. The mod also has its own screenshot, in Settings, and you can give it a key. It saves only the map, without the UI, two times: one with the effects and one without, so you can compare them.
 
-Shaders, presets and screenshots go in the RimWorld save folder, in ReShade. You can also copy your own shaders into ReShade/reshade-shaders/Shaders.
+Settings also has Performance mode, like ReShade's. The effect settings get built into the shaders so they run a bit faster, but changing a setting rebuilds the effect.
+
+Shaders, presets and screenshots go in the RimWorld save folder, in ReShade. You can also copy your own shaders into ReShade/reshade-shaders/Shaders. Compiled effects are kept in ReShade/Cache so the game starts faster next time.
 
 Presets use the same format as ReShade, so you can bring yours over. Presets that other mods have in a presets folder show up in Import too.
 

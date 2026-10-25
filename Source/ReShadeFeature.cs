@@ -5,13 +5,15 @@ using System.Diagnostics;
 using System.IO;
 using System.Threading;
 using Brutal.VulkanApi;
+using HarmonyLib;
 using Waylith.Graphics;
 using Waylith.Rendering;
+using Waylith.Rendering.PostFx;
 
 namespace ReShadeForRimWorld;
 
-// sits right before the game's PostFxFeature: takes the rendered scene, runs the effects on it,
-// and the game's composite pass then draws our result instead of the raw scene
+// sits right before the game's PostFxFeature: runs the effects on the rendered scene,
+// and the game's composite pass then draws our result instead of the raw scene (see CompositeInput)
 public sealed class ReShadeFeature : IRenderFeature, IRenderPass
 {
     private readonly IRenderFeature postFx;
@@ -23,8 +25,11 @@ public sealed class ReShadeFeature : IRenderFeature, IRenderPass
     private int frameCount;
 
     // touched only on the render thread
-    private FxTexture backBuffer, backBufferCopy, standIn, standIn1D, standIn3D;
-    private RenderTexture[] output = Array.Empty<RenderTexture>();
+    private FxTexture backBufferA, backBufferB, standIn, standIn1D, standIn3D;
+    private FxTexture[] sceneViews = Array.Empty<FxTexture>();
+    private readonly FrameTargets io = new();
+    private readonly HashSet<Effect> used = new();
+    private VkImageView[] output = Array.Empty<VkImageView>();
 
     // published by the runtime on the main thread, read on the render thread
     public volatile RenderItem[] RenderList = Array.Empty<RenderItem>();
@@ -36,6 +41,7 @@ public sealed class ReShadeFeature : IRenderFeature, IRenderPass
     public volatile string ScreenshotRequest;
 
     public readonly ConcurrentQueue<string> Messages = new();
+    public readonly GpuTimer Timer = new();
 
     public byte PassId { get; } = RenderPassRegistry.Register("ReShade");
     public PassAttachment Attachment => null;
@@ -50,11 +56,11 @@ public sealed class ReShadeFeature : IRenderFeature, IRenderPass
         passes = new IRenderPass[] { this };
     }
 
-    // what the composite pass should draw for this frame
-    public RenderTexture OutputFor(int frame)
+    // what the composite pass should draw for this frame, null when the scene is unchanged
+    public VkImageView OutputFor(int frame)
     {
-        RenderTexture[] o = output;
-        return (uint)frame < (uint)o.Length && o[frame] != null ? o[frame] : scene(frame);
+        VkImageView[] o = output;
+        return (uint)frame < (uint)o.Length ? o[frame] : default;
     }
 
     // size effects get compiled for; the scene target matches the window
@@ -122,9 +128,10 @@ public sealed class ReShadeFeature : IRenderFeature, IRenderPass
         int frame = ctx.SubmissionFrameIndex;
         if (output.Length != framesInFlight)
         {
-            output = new RenderTexture[framesInFlight];
+            output = new VkImageView[framesInFlight];
+            sceneViews = new FxTexture[framesInFlight];
         }
-        output[frame] = null;
+        output[frame] = default;
         RenderItem[] list = RenderList;
         ReleaseUnused(list);
         string screenshotRequest = ScreenshotRequest;
@@ -139,31 +146,51 @@ public sealed class ReShadeFeature : IRenderFeature, IRenderPass
         }
         CommandBuffer cmd = ctx.CommandBuffer;
         bool depthReadable = false;
+        Timer.Begin(in ctx);
         try
         {
             EnsureTargets(ctx.GraphicsDevice, source);
-            if (backBufferCopy.Fresh)
+            ClearIfFresh(cmd, backBufferA);
+            ClearIfFresh(cmd, backBufferB);
+            ClearIfFresh(cmd, standIn);
+            ClearIfFresh(cmd, standIn1D);
+            ClearIfFresh(cmd, standIn3D);
+
+            bool usesDepth = false, srgb = false;
+            foreach (RenderItem item in list)
             {
-                GpuUtil.ClearFresh(cmd, backBufferCopy);
+                Effect.CompileResult r = item.Effect.Result;
+                usesDepth |= r != null && r.UsesDepth;
+                srgb |= r != null && r.ReadsColorAsSrgb;
             }
-            foreach (FxTexture t in new[] { standIn, standIn1D, standIn3D })
+            io.A = backBufferA;
+            io.B = backBufferB;
+            io.StandIn = standIn;
+            io.StandIn1D = standIn1D;
+            io.StandIn3D = standIn3D;
+            // effects read the scene as it is; only an sRGB read needs our own copy, the scene image has no sRGB view
+            if (srgb && FxTexture.SrgbOf(source.ColorFormat) != VkFormat.Undefined)
             {
-                if (t.Fresh)
-                {
-                    GpuUtil.ClearFresh(cmd, t);
-                }
+                GpuUtil.Copy(cmd, source.Color.Image, backBufferA.Image, source.Width, source.Height);
+                io.Current = backBufferA;
             }
-            GpuUtil.Copy(cmd, source.Color.Image, backBuffer.Image, source.Width, source.Height, backBuffer.Fresh);
-            backBuffer.Fresh = false;
+            else
+            {
+                io.Current = SceneView(frame, source);
+            }
+            FxTexture original = io.Current;
+
             string screenshot = Interlocked.Exchange(ref ScreenshotRequest, null);
             bool before = ReShadeMod.Runtime?.Settings.SaveBeforeAndAfter ?? true;
             if (screenshot != null && before)
             {
-                Screenshot.Capture(cmd, ctx.GraphicsDevice, backBuffer.Image, backBuffer.Format, backBuffer.Width, backBuffer.Height, screenshot + " original.png", Say);
+                Screenshot.Capture(cmd, ctx.GraphicsDevice, original.Image, original.Format, original.Width, original.Height, screenshot + " original.png", Say);
             }
 
-            var io = new FrameTargets { BackBuffer = backBuffer, BackBufferCopy = backBufferCopy, StandIn = standIn, StandIn1D = standIn1D, StandIn3D = standIn3D };
-            if (UseDepth && source.HasDepth)
+            io.HasDepth = UseDepth && source.HasDepth;
+            io.Depth = default;
+            // the depth only changes layout when an effect samples it
+            if (io.HasDepth && usesDepth)
             {
                 io.Depth = source.DepthSampleView;
                 GpuUtil.DepthToRead(cmd, source.Depth.Image, source.DepthFormat, true);
@@ -172,21 +199,22 @@ public sealed class ReShadeFeature : IRenderFeature, IRenderPass
 
             foreach (RenderItem item in list)
             {
-                if (item.Effect.Prepare(in ctx, in data, in io, TexturePaths, Say))
+                if (item.Effect.Prepare(in ctx, in data, io, TexturePaths, Say))
                 {
                     builtEffects.Add(item.Effect);
-                    item.Effect.RecordTechnique(in ctx, in io, item.Technique);
+                    item.Effect.RecordTechnique(in ctx, io, item.Technique);
                 }
             }
 
             if (screenshot != null)
             {
-                Screenshot.Capture(cmd, ctx.GraphicsDevice, backBuffer.Image, backBuffer.Format, backBuffer.Width, backBuffer.Height, screenshot + ".png", Say);
+                Screenshot.Capture(cmd, ctx.GraphicsDevice, io.Current.Image, io.Current.Format, io.Current.Width, io.Current.Height, screenshot + ".png", Say);
             }
 
-            // hand the result to the composite through the scene's own render texture, so it keeps its format and size
-            GpuUtil.Copy(cmd, backBuffer.Image, source.Color.Image, source.Width, source.Height);
-            output[frame] = source;
+            if (!io.Current.External)
+            {
+                output[frame] = io.Current.View(false);
+            }
         }
         catch (Exception e)
         {
@@ -199,7 +227,27 @@ public sealed class ReShadeFeature : IRenderFeature, IRenderPass
             {
                 GpuUtil.DepthToRead(cmd, source.Depth.Image, source.DepthFormat, false);
             }
+            Timer.End(in ctx);
         }
+    }
+
+    private static void ClearIfFresh(CommandBuffer cmd, FxTexture t)
+    {
+        if (t.Fresh)
+        {
+            GpuUtil.ClearFresh(cmd, t);
+        }
+    }
+
+    // the scene's color image as a texture effects can read, one per frame in flight
+    private FxTexture SceneView(int frame, RenderTexture source)
+    {
+        FxTexture view = sceneViews[frame];
+        if (view == null || view.Image.VkHandle != source.Color.Image.VkHandle || view.Width != source.Width || view.Height != source.Height)
+        {
+            view = sceneViews[frame] = new FxTexture(source.Color.Image, source.Color.ImageView, source.Width, source.Height, source.ColorFormat, "Scene");
+        }
+        return view;
     }
 
     // effects with no enabled technique give their GPU memory back
@@ -209,10 +257,14 @@ public sealed class ReShadeFeature : IRenderFeature, IRenderPass
         {
             return;
         }
-        var used = new HashSet<Effect>();
+        used.Clear();
         foreach (RenderItem item in list)
         {
             used.Add(item.Effect);
+        }
+        if (builtEffects.IsSubsetOf(used))
+        {
+            return;
         }
         builtEffects.RemoveWhere(e =>
         {
@@ -230,14 +282,14 @@ public sealed class ReShadeFeature : IRenderFeature, IRenderPass
         standIn ??= new FxTexture(graphicsDevice, 1, 1, 1, VkFormat.R8G8B8A8UNorm, "StandIn");
         standIn1D ??= new FxTexture(graphicsDevice, 1, 1, 1, VkFormat.R8G8B8A8UNorm, "StandIn1D", dimensions: 1);
         standIn3D ??= new FxTexture(graphicsDevice, 1, 1, 1, VkFormat.R8G8B8A8UNorm, "StandIn3D", dimensions: 3);
-        if (backBuffer != null && backBuffer.Width == source.Width && backBuffer.Height == source.Height && backBuffer.Format == source.ColorFormat)
+        if (backBufferA != null && backBufferA.Width == source.Width && backBufferA.Height == source.Height && backBufferA.Format == source.ColorFormat)
         {
             return;
         }
-        backBuffer?.Dispose();
-        backBufferCopy?.Dispose();
-        backBuffer = new FxTexture(graphicsDevice, source.Width, source.Height, 1, source.ColorFormat, "BackBuffer");
-        backBufferCopy = new FxTexture(graphicsDevice, source.Width, source.Height, 1, source.ColorFormat, "BackBufferCopy");
+        backBufferA?.Dispose();
+        backBufferB?.Dispose();
+        backBufferA = new FxTexture(graphicsDevice, source.Width, source.Height, 1, source.ColorFormat, "BackBufferA");
+        backBufferB = new FxTexture(graphicsDevice, source.Width, source.Height, 1, source.ColorFormat, "BackBufferB");
         Say($"[ReShade] back buffer {source.Width}x{source.Height} {source.ColorFormat}");
     }
 
@@ -251,10 +303,32 @@ public sealed class ReShadeFeature : IRenderFeature, IRenderPass
         {
             e.Dispose();
         }
-        backBuffer?.Dispose();
-        backBufferCopy?.Dispose();
+        backBufferA?.Dispose();
+        backBufferB?.Dispose();
         standIn?.Dispose();
         standIn1D?.Dispose();
         standIn3D?.Dispose();
+    }
+}
+
+// the game's composite draws the map onto the screen; after effects ran it samples our result instead of the scene
+[HarmonyPatch(typeof(CompositePass), nameof(CompositePass.Record))]
+public static class CompositeInput
+{
+    public static bool Prefix(CompositePass __instance, in FrameContext ctx, object featurePayload)
+    {
+        if (featurePayload == null || ReShadeMod.Feature == null)
+        {
+            return true;
+        }
+        VkImageView view = ReShadeMod.Feature.OutputFor(ctx.SubmissionFrameIndex);
+        if (view.IsNull())
+        {
+            return true;
+        }
+        __instance.SetInput(0, view, __instance.Sampler);
+        __instance.SetUniforms(__instance.Saturation);
+        __instance.RecordInline(in ctx, ctx.RenderPass, ctx.SampleCount);
+        return false;
     }
 }

@@ -13,6 +13,9 @@ public static class Overlay
 {
     // RESHADE_OVERLAY_OPEN=1 opens it at start, handy when testing without a keyboard
     public static bool Open = Environment.GetEnvironmentVariable("RESHADE_OVERLAY_OPEN") == "1";
+    // effects nothing uses yet only get compiled once the list was shown
+    public static bool EverOpened;
+    private static readonly string testEditFile = Environment.GetEnvironmentVariable("RESHADE_EDIT_FILE");
     // 1 = waiting for the overlay key, 2 = waiting for the screenshot key
     public static int WaitingForKey;
 
@@ -54,11 +57,10 @@ public static class Overlay
         {
             return;
         }
-        string editFile = Environment.GetEnvironmentVariable("RESHADE_EDIT_FILE");
-        if (editFile != null && !testEditorOpened)
+        if (testEditFile != null && !testEditorOpened)
         {
             testEditorOpened = true;
-            Editor.Open(editFile);
+            Editor.Open(testEditFile);
         }
         if (!Open)
         {
@@ -66,6 +68,7 @@ public static class Overlay
         }
         else
         {
+            EverOpened = true;
             DrawWindow(rt);
         }
         if (importOpen)
@@ -78,7 +81,7 @@ public static class Overlay
     // like ReShade's startup message, shown for a few seconds or while effects compile
     private static void DrawBanner(Runtime rt)
     {
-        int compiling = rt.Effects.Count(e => e.Compiling || e.Result == null);
+        rt.CompileProgress(out int compiling, out int total);
         bool early = DateTime.UtcNow - started < TimeSpan.FromSeconds(12);
         if (!early && compiling == 0)
         {
@@ -92,7 +95,7 @@ public static class Overlay
             ImGui.Text($"Press {KeyName(rt.Settings.OverlayKey)} to open the overlay.");
             if (compiling > 0)
             {
-                ImGui.Text($"Compiling effects... {rt.Effects.Count - compiling}/{rt.Effects.Count}");
+                ImGui.Text($"Compiling effects... {total - compiling}/{total}");
             }
             int failed = rt.Listed.Count(kv => !kv.Value.Success);
             if (failed > 0)
@@ -245,6 +248,13 @@ public static class Overlay
         {
             ImGui.SameLine();
             ImGui.TextColored(yellow, $"{waiting} compiling");
+        }
+        // like ReShade's statistics: what the mod costs on the GPU
+        float gpuMs = rt.Feature.Timer.AverageMs + (rt.Layers?.Timer.AverageMs ?? 0f);
+        if (gpuMs > 0f)
+        {
+            ImGui.SameLine();
+            ImGui.TextColored(grey, $"GPU {gpuMs:0.00} ms");
         }
 
         // the usual reason a whole folder fails: ReShade.fxh comes with the Standard effects package
@@ -406,7 +416,7 @@ public static class Overlay
                 {
                     continue;
                 }
-                var uniforms = result.Module.uniforms.Where(Variables.Editable).ToList();
+                var uniforms = result.Module.Variables.Where(Variables.Editable).ToList();
                 if (uniforms.Count == 0)
                 {
                     continue;
@@ -819,6 +829,26 @@ public static class Overlay
             s.ShowUiTab = showUi;
             s.Save();
             rt.Publish();
+        }
+
+        ImGui.SeparatorText("Effects");
+        bool performance = s.PerformanceMode;
+        if (ImGui.Checkbox("Performance mode", ref performance))
+        {
+            s.PerformanceMode = performance;
+            s.Save();
+        }
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip("Like ReShade's: the settings of each effect are built into its shaders, so they run a bit faster.\nChanging a setting then rebuilds the effect, so sliders are slower to drag.");
+        }
+        if (ImGui.Button("Clear the effect cache"))
+        {
+            CompileCache.Clear();
+        }
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip("Compiled effects are kept in " + CompileCache.Dir + " so the next start is faster");
         }
 
         ImGui.SeparatorText("Screenshots");

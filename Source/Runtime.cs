@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
@@ -45,8 +46,13 @@ public sealed class Runtime
     // a preset waiting for its packages to finish installing
     public string PendingPreset;
 
-    private readonly Dictionary<Effect, int> compiledWidth = new();
     private int running;
+    // the definitions as last joined, rebuilt only when one of the two lists changes
+    private string defineKey;
+    private List<string> defineList = new();
+    // shader folder changes reported by the watcher; polling is only the fallback when there is no watcher
+    private FileSystemWatcher watcher;
+    private readonly ConcurrentQueue<(string path, bool added)> changes = new();
     private DateTime presetDirtySince = DateTime.MaxValue;
     private int tick;
 
@@ -57,12 +63,101 @@ public sealed class Runtime
         Directory.CreateDirectory(ReShadeMod.ShadersDir);
         Directory.CreateDirectory(ReShadeMod.TexturesDir);
         Preset = Preset.Load(Settings.PresetPath);
+        Watch();
         ScanEffects();
         Feature.IncludePaths = IncludePaths();
         Feature.TexturePaths = new List<string> { ReShadeMod.TexturesDir };
     }
 
     public IList<string> Definitions => Settings.GlobalDefinitions.Concat(Preset.Definitions).ToList();
+
+    // the same list and key as long as nothing changed, so the per frame check allocates nothing
+    private string DefineKey()
+    {
+        List<string> global = Settings.GlobalDefinitions, preset = Preset.Definitions;
+        bool same = defineKey != null && defineList.Count == global.Count + preset.Count;
+        for (int i = 0; same && i < global.Count; i++)
+        {
+            same = defineList[i] == global[i];
+        }
+        for (int i = 0; same && i < preset.Count; i++)
+        {
+            same = defineList[global.Count + i] == preset[i];
+        }
+        if (!same)
+        {
+            defineList = global.Concat(preset).ToList();
+            defineKey = string.Join("\n", defineList);
+        }
+        return defineKey;
+    }
+
+    private void Watch()
+    {
+        try
+        {
+            watcher?.Dispose();
+            watcher = new FileSystemWatcher(ReShadeMod.ShadersDir)
+            {
+                IncludeSubdirectories = true,
+                NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.LastWrite | NotifyFilters.Size
+            };
+            watcher.Changed += (_, e) => changes.Enqueue((e.FullPath, false));
+            watcher.Created += (_, e) => changes.Enqueue((e.FullPath, true));
+            watcher.Deleted += (_, e) => changes.Enqueue((e.FullPath, true));
+            watcher.Renamed += (_, e) =>
+            {
+                changes.Enqueue((e.OldFullPath, true));
+                changes.Enqueue((e.FullPath, true));
+            };
+            // too many changes at once or the folder went away: start over
+            watcher.Error += (_, _) => changes.Enqueue((null, true));
+            watcher.EnableRaisingEvents = true;
+        }
+        catch (Exception e)
+        {
+            watcher = null;
+            Feature.Say("[ReShade] can't watch the shader folder, checking it every few seconds instead: " + e.Message);
+        }
+    }
+
+    // main thread: effects whose file or an included file changed compile again, new or removed files mean a rescan
+    private void HandleChanges()
+    {
+        bool rescan = false;
+        HashSet<string> changed = null;
+        while (changes.TryDequeue(out var c))
+        {
+            if (c.path == null)
+            {
+                rescan = true;
+                Watch();
+                continue;
+            }
+            bool fx = c.path.EndsWith(".fx", StringComparison.OrdinalIgnoreCase);
+            if (c.added && (fx || Directory.Exists(c.path) || !Path.HasExtension(c.path)))
+            {
+                rescan = true;
+            }
+            (changed ??= new HashSet<string>(StringComparer.Ordinal)).Add(Path.GetFullPath(c.path));
+        }
+        if (rescan)
+        {
+            ScanEffects();
+            return;
+        }
+        if (changed == null)
+        {
+            return;
+        }
+        foreach (Effect e in Effects)
+        {
+            if (changed.Contains(e.FilePath) || (e.Result?.Included.Any(f => changed.Contains(Path.GetFullPath(f))) ?? false))
+            {
+                e.Stale = true;
+            }
+        }
+    }
 
     // ReShade searches its effect paths recursively and loads every .fx it finds
     public void ScanEffects()
@@ -108,11 +203,16 @@ public sealed class Runtime
     public void Tick()
     {
         tick++;
+        TestHooks.Tick(this);
+        HandleChanges();
         if (tick % 30 == 0)
         {
-            foreach (Effect e in Effects)
+            if (watcher == null && tick % 300 == 0)
             {
-                e.CheckSource();
+                foreach (Effect e in Effects)
+                {
+                    e.CheckSource();
+                }
             }
             if (File.Exists(ReShadeMod.ScreenshotTriggerFile))
             {
@@ -163,44 +263,92 @@ public sealed class Runtime
         }
     }
 
+    // effects the preset turns on compile first; the rest only once the overlay was opened, where they get listed
     private void ScheduleCompiles(int width, int height)
     {
-        IList<string> defines = Definitions;
-        string defineKey = string.Join("\n", defines);
-        IList<string> include = Feature.IncludePaths;
-        foreach (Effect e in Effects)
+        if (running >= 2)
         {
-            if (running >= 2)
+            return;
+        }
+        string key = DefineKey();
+        IList<string> defines = defineList;
+        bool performance = Settings.PerformanceMode;
+        IList<string> include = Feature.IncludePaths;
+        for (int pass = 0; pass < 2; pass++)
+        {
+            if (pass == 1 && !Overlay.EverOpened)
             {
                 return;
             }
-            Effect.CompileResult r = e.Result;
-            bool outdated = r == null || r.Width != width || r.Height != height || r.Defines != defineKey;
-            if (e.Compiling || !(e.Stale || outdated))
+            foreach (Effect e in Effects)
+            {
+                if (running >= 2)
+                {
+                    return;
+                }
+                Effect.CompileResult r = e.Result;
+                bool outdated = r == null || r.Width != width || r.Height != height || !ReferenceEquals(r.Defines, key) && r.Defines != key || r.PerformanceMode != performance;
+                if (e.Compiling || !(e.Stale || outdated) || (pass == 0 && !presetEffects.Contains(e.Name)))
+                {
+                    continue;
+                }
+                e.Stale = false;
+                e.Compiling = true;
+                System.Threading.Interlocked.Increment(ref running);
+                string path = e.FilePath;
+                Task.Run(() =>
+                {
+                    try
+                    {
+                        e.Result = Effect.Compile(path, width, height, include, defines, key, performance);
+                    }
+                    catch (Exception ex)
+                    {
+                        e.Result = new Effect.CompileResult { Errors = ex.Message, Width = width, Height = height, Defines = key, PerformanceMode = performance };
+                    }
+                    finally
+                    {
+                        e.Compiling = false;
+                        System.Threading.Interlocked.Decrement(ref running);
+                    }
+                });
+            }
+        }
+    }
+
+    // effects still to compile out of the ones that will be, the rest wait for the overlay to open
+    public void CompileProgress(out int pending, out int total)
+    {
+        pending = 0;
+        total = 0;
+        foreach (Effect e in Effects)
+        {
+            if (!Overlay.EverOpened && !presetEffects.Contains(e.Name))
             {
                 continue;
             }
-            e.Stale = false;
-            e.Compiling = true;
-            System.Threading.Interlocked.Increment(ref running);
-            string path = e.FilePath;
-            Task.Run(() =>
+            total++;
+            if (e.Compiling || e.Result == null)
             {
-                try
-                {
-                    e.Result = Effect.Compile(path, width, height, include, defines);
-                }
-                catch (Exception ex)
-                {
-                    e.Result = new Effect.CompileResult { Errors = ex.Message, Width = width, Height = height, Defines = defineKey };
-                }
-                finally
-                {
-                    e.Compiling = false;
-                    System.Threading.Interlocked.Decrement(ref running);
-                }
-            });
+                pending++;
+            }
         }
+    }
+
+    // effect files with a technique on in the Game or UI list, or in the preset for effects not compiled yet
+    private HashSet<string> presetEffects = new(StringComparer.OrdinalIgnoreCase);
+
+    private void FindPresetEffects()
+    {
+        static string File(string id) => id.Substring(id.IndexOf('@') + 1);
+        var names = new HashSet<string>(Preset.Techniques.Select(File), StringComparer.OrdinalIgnoreCase);
+        if (Settings.ShowUiTab)
+        {
+            names.UnionWith(Preset.TechniquesUI.Select(File));
+            names.UnionWith(UiTechniques.Where(t => t.Enabled).Select(t => t.Effect.Name));
+        }
+        names.UnionWith(Techniques.Where(t => t.Enabled).Select(t => t.Effect.Name));
+        presetEffects = names;
     }
 
     public Effect UiCopy(Effect e)
@@ -287,7 +435,7 @@ public sealed class Runtime
     {
         var values = new Dictionary<string, float[]>();
         Preset.Values.TryGetValue(section, out var saved);
-        foreach (FxUniform u in module.uniforms)
+        foreach (FxUniform u in module.Variables)
         {
             if (u.annotations.GetString("source") != null || u.type.array_length > 0)
             {
@@ -327,6 +475,7 @@ public sealed class Runtime
     // publishes the enabled techniques to the render thread and remembers them in the preset
     public void Publish()
     {
+        FindPresetEffects();
         // the Game list runs on the map, or with "also change the UI" on the whole screen after the UI is drawn, like ReShade
         bool whole = Preset.GameChangesUI && Layers != null;
         RenderItem[] game = Techniques.Where(t => t.Enabled).Select(t => new RenderItem { Effect = whole ? ScreenCopy(t.Effect) : t.Effect, Technique = t.Name }).ToArray();
@@ -336,7 +485,8 @@ public sealed class Runtime
             Layers.ScreenList = whole ? game : Array.Empty<RenderItem>();
             // the UI tab's effects only run while the tab is turned on in the settings
             Layers.UiList = Settings.ShowUiTab ? UiTechniques.Where(t => t.Enabled).Select(t => new RenderItem { Effect = t.Effect, Technique = t.Name }).ToArray() : Array.Empty<RenderItem>();
-            // the UI is only taken over from the game while something needs it
+            // the UI is only split while something needs it, and only taken from the game for UI effects
+            UiCapture.TakeOver = Layers.UiList.Length > 0;
             UiCapture.Wanted = Layers.ScreenList.Length > 0 || Layers.UiList.Length > 0;
         }
         MarkPresetDirty();
@@ -349,12 +499,12 @@ public sealed class Runtime
         var listedNames = new HashSet<string>(Listed.Where(kv => kv.Value.Success).Select(kv => kv.Key.Name), StringComparer.OrdinalIgnoreCase);
         bool Pending(string id) => !listedNames.Contains(id.Substring(id.IndexOf('@') + 1));
         Preset.Techniques = Techniques.Where(t => t.Enabled).Select(t => t.Id).Concat(Preset.Techniques.Where(Pending)).Distinct().ToList();
-        Preset.TechniqueSorting = Techniques.Select(t => t.Id).Concat(Preset.TechniqueSorting.Where(Pending)).Distinct().ToList();
+        Preset.TechniqueSorting = KeepPlaces(Techniques.Select(t => t.Id).ToList(), Preset.TechniqueSorting, Pending);
         Preset.TechniquesUI = UiTechniques.Where(t => t.Enabled).Select(t => t.Id).Concat(Preset.TechniquesUI.Where(Pending)).Distinct().ToList();
         // the UI order only matters once something there was turned on
         Preset.TechniqueSortingUI = Preset.TechniquesUI.Count == 0 && Preset.TechniqueSortingUI.Count == 0
             ? new List<string>()
-            : UiTechniques.Select(t => t.Id).Concat(Preset.TechniqueSortingUI.Where(Pending)).Distinct().ToList();
+            : KeepPlaces(UiTechniques.Select(t => t.Id).ToList(), Preset.TechniqueSortingUI, Pending);
         foreach (Effect e in Effects)
         {
             if (!Listed.TryGetValue(e, out var r) || r.Module == null)
@@ -377,11 +527,37 @@ public sealed class Runtime
         }
     }
 
+    // the listed order, with techniques still compiling put back where the old order had them
+    // (right after the technique they followed), so a save during startup doesn't move them to the end
+    private static List<string> KeepPlaces(List<string> listed, List<string> old, Func<string, bool> pending)
+    {
+        var result = listed.Distinct().ToList();
+        string previous = null;
+        foreach (string id in old)
+        {
+            if (result.Contains(id))
+            {
+                if (!pending(id))
+                {
+                    previous = id;
+                }
+                continue;
+            }
+            if (!pending(id))
+            {
+                continue;
+            }
+            result.Insert(previous == null ? 0 : result.IndexOf(previous) + 1, id);
+            previous = id;
+        }
+        return result;
+    }
+
     // only values that differ from the effect's defaults go in the preset, like ReShade
     private void SaveValues(Effect e, FxModule module, string name)
     {
         var section = new Dictionary<string, float[]>();
-        foreach (FxUniform u in module.uniforms)
+        foreach (FxUniform u in module.Variables)
         {
             if (e.Values.TryGetValue(u.name, out float[] v) && !v.SequenceEqual(Variables.Defaults(u)))
             {
@@ -501,6 +677,8 @@ public sealed class Settings
     public bool SaveBeforeAndAfter = true;
     // the UI tab is for people who want it, off by default
     public bool ShowUiTab;
+    // ReShade's performance mode: variables become constants in the shaders, faster but changing one rebuilds the effect
+    public bool PerformanceMode;
     public string ScreenshotPath;
     public string PresetPath;
     public List<string> GlobalDefinitions = new();
@@ -531,6 +709,7 @@ public sealed class Settings
                 case "KeyScreenshot": int.TryParse(value, out s.ScreenshotKey); break;
                 case "SaveBeforeShot": s.SaveBeforeAndAfter = value == "1"; break;
                 case "ShowUiTab": s.ShowUiTab = value == "1"; break;
+                case "PerformanceMode": s.PerformanceMode = value == "1"; break;
                 case "SavePath": s.ScreenshotPath = ReShadeMod.FromStored(value); break;
                 case "PresetPath": s.PresetPath = ReShadeMod.FromStored(value); break;
                 case "PreprocessorDefinitions": s.GlobalDefinitions = value.Split(',').Select(v => v.Trim()).Where(v => v.Length > 0).ToList(); break;
@@ -547,6 +726,7 @@ public sealed class Settings
             "[GENERAL]",
             "PresetPath=" + ReShadeMod.ToStored(PresetPath),
             "PreprocessorDefinitions=" + string.Join(",", GlobalDefinitions),
+            "PerformanceMode=" + (PerformanceMode ? "1" : "0"),
             "",
             "[INPUT]",
             "KeyOverlay=" + OverlayKey.ToString(CultureInfo.InvariantCulture),

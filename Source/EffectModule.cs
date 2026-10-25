@@ -159,6 +159,45 @@ public sealed class FxModule
         json = json.Replace("\"base\":", "\"base_\":");
         return JsonSerializer.Deserialize<FxModule>(json);
     }
+
+    private List<FxUniform> variables;
+
+    // what the overlay and the preset work with: the uniforms, plus in performance mode the
+    // specialization constants put back together (the compiler splits them into one per component)
+    public List<FxUniform> Variables => variables ??= BuildVariables();
+
+    private List<FxUniform> BuildVariables()
+    {
+        var list = new List<FxUniform>(uniforms);
+        if (spec_constants == null || spec_constants.Count == 0)
+        {
+            return list;
+        }
+        foreach (var group in spec_constants.Where(c => c.type.array_length == 0).GroupBy(c => c.name))
+        {
+            FxUniform first = group.First();
+            int n = group.Max(c => c.offset) + 1;
+            var f = new float[n];
+            var i = new int[n];
+            foreach (FxUniform c in group)
+            {
+                f[c.offset] = c.initializer?.f?.FirstOrDefault() ?? 0f;
+                i[c.offset] = c.initializer?.i?.FirstOrDefault() ?? 0;
+            }
+            list.Add(new FxUniform
+            {
+                name = first.name,
+                unique_name = first.unique_name,
+                type = new FxType { base_ = first.type.base_, rows = n, cols = 1 },
+                size = n * 4,
+                offset = -1,
+                annotations = first.annotations,
+                has_initializer = true,
+                initializer = new FxConstant { f = f, i = i }
+            });
+        }
+        return list;
+    }
 }
 
 public static class FxAnnotations

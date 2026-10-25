@@ -26,8 +26,13 @@ public sealed class FxTexture : IDisposable
     private GpuTextureAllocation allocation;
     private VkImageView srgbView, linearMip0, srgbMip0;
 
-    public VkImage Image => allocation.Image;
-    public VkImageView View(bool srgb) => srgb && !srgbView.IsNull() ? srgbView : allocation.ImageView;
+    // an image we only read and don't own, like the scene the game rendered
+    private readonly VkImage externalImage;
+    private readonly VkImageView externalView;
+    public bool External => allocation == null && !externalView.IsNull();
+
+    public VkImage Image => allocation?.Image ?? externalImage;
+    public VkImageView View(bool srgb) => srgb && !srgbView.IsNull() ? srgbView : allocation?.ImageView ?? externalView;
     public VkImageView TargetView(bool srgb) => srgb && !srgbMip0.IsNull() ? srgbMip0 : linearMip0;
     public VkFormat TargetFormat(bool srgb) => srgb && SrgbFormat != VkFormat.Undefined ? SrgbFormat : Format;
     public VkExtent2D Extent => new VkExtent2D(Width, Height);
@@ -53,6 +58,21 @@ public sealed class FxTexture : IDisposable
             framebuffers[renderPass.VkHandle] = fb;
         }
         return fb;
+    }
+
+    public FxTexture(VkImage image, VkImageView view, int width, int height, VkFormat format, string name)
+    {
+        externalImage = image;
+        externalView = view;
+        Width = width;
+        Height = height;
+        Depth = 1;
+        Levels = 1;
+        Dimensions = 2;
+        Format = format;
+        SrgbFormat = VkFormat.Undefined;
+        Name = name;
+        Fresh = false;
     }
 
     public FxTexture(GraphicsDevice graphicsDevice, int width, int height, int levels, VkFormat format, string name, bool depthStencil = false, bool storage = false, int dimensions = 2, int depth = 1)

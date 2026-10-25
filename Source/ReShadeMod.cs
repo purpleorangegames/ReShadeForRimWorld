@@ -161,7 +161,6 @@ public class ReShadeMod : Mod
             {
                 Log.Warning("[ReShade] could not find the game's UI pass, the UI tab won't do anything");
             }
-            composite.Source = Feature.OutputFor;
             new Harmony("tiagocc0.reshadeforrimworld").PatchAll();
             Log.Message($"[ReShade] ready, {Runtime.Effects.Count} effects in {ShadersDir}, preset {Runtime.Preset.Path}");
         }

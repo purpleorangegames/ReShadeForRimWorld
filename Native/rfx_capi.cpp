@@ -9,6 +9,8 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <vector>
+#include <cstdlib>
 
 #if defined(_WIN32)
 #define RFX_API extern "C" __declspec(dllexport)
@@ -22,6 +24,7 @@ struct rfx_result
 	std::string errors;
 	std::string json;
 	std::string preprocessed;
+	std::string included;
 	std::unordered_map<std::string, std::string> spirv;
 };
 
@@ -297,7 +300,9 @@ namespace
 }
 
 // defines: "NAME=VALUE" strings. include_paths: directories searched for #include.
-RFX_API rfx_result *rfx_compile(const char *path, const char *const *include_paths, int include_count, const char *const *defines, int define_count)
+// performance_mode: uniforms with an initializer become specialization constants (ReShade's performance mode),
+// their values are given at pipeline creation (VkSpecializationInfo, SpecId = index in spec_constants).
+RFX_API rfx_result *rfx_compile2(const char *path, const char *const *include_paths, int include_count, const char *const *defines, int define_count, int performance_mode)
 {
 	auto *r = new rfx_result();
 
@@ -327,11 +332,17 @@ RFX_API rfx_result *rfx_compile(const char *path, const char *const *include_pat
 
 	const bool preprocessed = pp.append_file(std::filesystem::u8path(path));
 	r->errors += pp.errors();
+	for (const std::filesystem::path &file : pp.included_files())
+	{
+		const auto name = file.u8string();
+		r->included.append(reinterpret_cast<const char *>(name.data()), name.size());
+		r->included += '\n';
+	}
 	if (!preprocessed)
 		return r;
 	r->preprocessed = pp.output();
 
-	std::unique_ptr<reshadefx::codegen> codegen(reshadefx::create_codegen_spirv(true, false, false, false, false));
+	std::unique_ptr<reshadefx::codegen> codegen(reshadefx::create_codegen_spirv(true, false, performance_mode != 0, false, false));
 	reshadefx::parser parser;
 	const bool compiled = parser.parse(r->preprocessed, codegen.get());
 	r->errors += parser.errors();
@@ -356,6 +367,12 @@ RFX_API rfx_result *rfx_compile(const char *path, const char *const *include_pat
 	return r;
 }
 
+RFX_API rfx_result *rfx_compile(const char *path, const char *const *include_paths, int include_count, const char *const *defines, int define_count)
+{
+	return rfx_compile2(path, include_paths, include_count, defines, define_count, 0);
+}
+
+RFX_API const char *rfx_included_files(const rfx_result *r) { return r ? r->included.c_str() : ""; }
 RFX_API int rfx_success(const rfx_result *r) { return r && r->success ? 1 : 0; }
 RFX_API const char *rfx_errors(const rfx_result *r) { return r ? r->errors.c_str() : ""; }
 RFX_API const char *rfx_module_json(const rfx_result *r) { return r ? r->json.c_str() : ""; }

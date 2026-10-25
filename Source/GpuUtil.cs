@@ -267,8 +267,9 @@ public static class GpuUtil
     }
 
     // render pass for 1..8 color targets plus an optional stencil buffer (always loaded, see ClearStencil);
-    // color Load expects ShaderReadOnlyOptimal, colors end in ShaderReadOnlyOptimal
-    public static unsafe VkRenderPass CreateRenderPass(DeviceEx device, ReadOnlySpan<VkFormat> formats, bool clear, VkFormat stencilFormat = VkFormat.Undefined)
+    // color Load expects ShaderReadOnlyOptimal, colors end in ShaderReadOnlyOptimal.
+    // dontCare: the pass draws over every pixel, so the old image isn't kept (saves reading it on tiled GPUs)
+    public static unsafe VkRenderPass CreateRenderPass(DeviceEx device, ReadOnlySpan<VkFormat> formats, bool clear, VkFormat stencilFormat = VkFormat.Undefined, bool dontCare = false)
     {
         int n = formats.Length;
         bool stencil = stencilFormat != VkFormat.Undefined;
@@ -280,11 +281,11 @@ public static class GpuUtil
             {
                 Format = formats[i],
                 Samples = VkSampleCountFlags._1Bit,
-                LoadOp = clear ? VkAttachmentLoadOp.Clear : VkAttachmentLoadOp.Load,
+                LoadOp = clear ? VkAttachmentLoadOp.Clear : dontCare ? VkAttachmentLoadOp.DontCare : VkAttachmentLoadOp.Load,
                 StoreOp = VkAttachmentStoreOp.Store,
                 StencilLoadOp = VkAttachmentLoadOp.DontCare,
                 StencilStoreOp = VkAttachmentStoreOp.DontCare,
-                InitialLayout = clear ? VkImageLayout.Undefined : VkImageLayout.ShaderReadOnlyOptimal,
+                InitialLayout = clear || dontCare ? VkImageLayout.Undefined : VkImageLayout.ShaderReadOnlyOptimal,
                 FinalLayout = VkImageLayout.ShaderReadOnlyOptimal
             };
             refs[i] = new VkAttachmentReference { Attachment = i, Layout = VkImageLayout.ColorAttachmentOptimal };
