@@ -3,7 +3,7 @@
   <name>ReShade for RimWorld (unofficial)</name>
   <author>tiagocc0</author>
   <packageId>tiagocc0.reshadeforrimworld</packageId>
-  <modVersion>1.0.0</modVersion>
+  <modVersion>1.1.0</modVersion>
   <url>https://github.com/purpleorangegames/ReShadeForRimWorld</url>
   <supportedVersions>
     <li>1.7</li>
