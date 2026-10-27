@@ -299,6 +299,7 @@ public sealed class ReShadeFeature : IRenderFeature, IRenderPass
 
     public void Dispose()
     {
+        GpuGarbage.Close();
         foreach (Effect e in builtEffects)
         {
             e.Dispose();

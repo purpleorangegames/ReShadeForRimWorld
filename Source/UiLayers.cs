@@ -675,6 +675,11 @@ void main()
 
     public void Dispose()
     {
+        GpuGarbage.Close();
+        foreach (Effect e in builtEffects)
+        {
+            e.Dispose();
+        }
         foreach (FxTexture t in new[] { screen, uiRaw, uiFx, uiFxCopy, final, finalCopy, standIn, standIn1D, standIn3D })
         {
             t?.Dispose();
