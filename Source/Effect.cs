@@ -99,6 +99,7 @@ public sealed unsafe class Effect : IDisposable
 
     private DeviceEx device;
     private GraphicsDevice graphicsDevice;
+    private long uniformLedger;
     private FxTexture builtFor;
     private readonly Dictionary<string, FxTexture> textures = new();
     private readonly List<(FxTexture tex, byte[] pixels)> uploads = new();
@@ -666,6 +667,7 @@ public sealed unsafe class Effect : IDisposable
             Priority = 1f
         };
         uniformBuffer = graphicsDevice.Allocator.AllocateBufferChecked("ReShade." + Name + ".Uniforms", in bufferInfo, in allocInfo);
+        uniformLedger = GpuLedger.Take(Name + ".Uniforms");
         uniformMap = new AllocationMapInfo(uniformBuffer.AllocationInfo)
         {
             Region = new MapRegion { Offset = ByteSize.Zero, Size = uniformBuffer.BufferSize }
@@ -1206,6 +1208,7 @@ public sealed unsafe class Effect : IDisposable
         pipelineLayout = default;
         bool hadUniforms = uniformMapped != null;
         BufferAllocationInfo oldBuffer = uniformBuffer;
+        long oldLedger = uniformLedger;
         AllocationMapInfo oldMap = uniformMap;
         VmaAllocator allocator = graphicsDevice.Allocator;
         uniformMapped = null;
@@ -1245,6 +1248,7 @@ public sealed unsafe class Effect : IDisposable
             {
                 allocator.UnmapMemory(in oldMap);
                 allocator.FreeAllocation(in oldBuffer);
+                GpuLedger.Free(oldLedger);
             }
             if (!oldLayout.IsNull())
             {

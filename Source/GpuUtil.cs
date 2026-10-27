@@ -174,6 +174,7 @@ public static class GpuUtil
             Priority = 0.5f
         };
         BufferAllocationInfo staging = allocator.AllocateBufferChecked("ReShade.Upload." + tex.Name, in bufferInfo, in allocInfo);
+        long id = GpuLedger.Take("Upload." + tex.Name);
         var map = new AllocationMapInfo(staging.AllocationInfo)
         {
             Region = new MapRegion { Offset = ByteSize.Zero, Size = staging.BufferSize }
@@ -198,7 +199,11 @@ public static class GpuUtil
             Barrier(tex.Image, VkImageLayout.TransferDstOptimal, VkImageLayout.ShaderReadOnlyOptimal, VkAccessFlags.TransferWriteBit, AnyRead | VkAccessFlags.TransferReadBit, 0, tex.Levels));
         tex.Fresh = false;
         GenerateMips(cmd, tex);
-        GpuGarbage.Add(() => allocator.FreeAllocation(in staging));
+        GpuGarbage.Add(() =>
+        {
+            allocator.FreeAllocation(in staging);
+            GpuLedger.Free(id);
+        });
     }
 
     // around a compute pass: the textures it writes go to General and back, like ReShade's unordered_access state

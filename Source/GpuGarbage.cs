@@ -28,7 +28,7 @@ public static class GpuGarbage
         closing = true;
         foreach ((long _, Action destroy) in pending)
         {
-            destroy();
+            QuitTrace.Try("a pending GPU object", destroy);
         }
         pending.Clear();
     }

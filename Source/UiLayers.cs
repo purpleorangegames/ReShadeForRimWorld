@@ -678,15 +678,15 @@ void main()
         GpuGarbage.Close();
         foreach (Effect e in builtEffects)
         {
-            e.Dispose();
+            QuitTrace.Try(e.Name, e.Dispose);
         }
         foreach (FxTexture t in new[] { screen, uiRaw, uiFx, uiFxCopy, final, finalCopy, standIn, standIn1D, standIn3D })
         {
-            t?.Dispose();
+            QuitTrace.Try(t?.Name, () => t?.Dispose());
         }
-        (uiRenderer as IDisposable)?.Dispose();
-        (overlayRenderer as IDisposable)?.Dispose();
-        unpremultiply.Dispose();
-        composite.Dispose();
+        QuitTrace.Try("the UI renderer", () => (uiRenderer as IDisposable)?.Dispose());
+        QuitTrace.Try("the overlay renderer", () => (overlayRenderer as IDisposable)?.Dispose());
+        QuitTrace.Try("unpremultiply", unpremultiply.Dispose);
+        QuitTrace.Try("composite", composite.Dispose);
     }
 }

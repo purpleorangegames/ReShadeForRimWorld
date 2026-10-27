@@ -24,6 +24,7 @@ public sealed class FxTexture : IDisposable
 
     private readonly DeviceEx device;
     private GpuTextureAllocation allocation;
+    private long ledger;
     private VkImageView srgbView, linearMip0, srgbMip0;
 
     // an image we only read and don't own, like the scene the game rendered
@@ -108,6 +109,7 @@ public sealed class FxTexture : IDisposable
             InitialLayout = VkImageLayout.Undefined
         };
         ImageAllocationInfo image = GpuTextureService.AllocateTextureImage(graphicsDevice.Allocator, "ReShade." + name, GpuMemoryCategory.RenderTarget, in info);
+        ledger = GpuLedger.Take(name);
         VkImageView view = CreateView(image.Image, format, 0, Levels);
         allocation = new GpuTextureAllocation(device, graphicsDevice.Allocator, image, view, new IntPtr(Interlocked.Increment(ref nextHandle)), Levels, format, "ReShade." + name, GpuMemoryCategory.RenderTarget);
         linearMip0 = Levels == 1 ? view : CreateView(image.Image, format, 0, 1);
@@ -159,6 +161,7 @@ public sealed class FxTexture : IDisposable
             return;
         }
         GpuTextureAllocation a = allocation;
+        long id = ledger;
         VkImageView[] views = new[] { srgbView, Levels > 1 ? linearMip0 : default, Levels > 1 ? srgbMip0 : default }.Concat(storageViews).ToArray();
         DeviceEx d = device;
         VkFramebuffer[] fbs = framebuffers.Values.ToArray();
@@ -179,6 +182,7 @@ public sealed class FxTexture : IDisposable
             }
             // the engine defers the image itself again, which is fine
             a.Dispose();
+            GpuLedger.Free(id);
         });
     }
 }

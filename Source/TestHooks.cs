@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Linq;
+using RimWorld;
 using Verse;
 
 namespace ReShadeForRimWorld;
@@ -10,6 +11,8 @@ namespace ReShadeForRimWorld;
 // RESHADE_TEST_LOAD=<name>  loads that save from the main menu and pauses it, so every run shows the same frame
 // RESHADE_PERF_LOG=1        logs the GPU time of the mod's work every few seconds
 // RESHADE_TEST_CYCLE=<dir>  after loading, goes through every preset .ini in dir and saves a screenshot of each to dir/shots
+// RESHADE_TEST_RUN=1        after loading, lets the time run instead of pausing
+// RESHADE_TEST_WORLD=1      after loading, goes to the world map (with the cycle, to see the effects there)
 public static class TestHooks
 {
     private static readonly string saveName = Environment.GetEnvironmentVariable("RESHADE_TEST_SAVE");
@@ -19,6 +22,8 @@ public static class TestHooks
     private static int playingFrames;
     private static DateTime lastPerfLog = DateTime.UtcNow;
     private static readonly string cycleDir = Environment.GetEnvironmentVariable("RESHADE_TEST_CYCLE");
+    private static readonly bool world = Environment.GetEnvironmentVariable("RESHADE_TEST_WORLD") == "1";
+    private static bool worldShown;
     private static string[] cycle;
     private static int cycleStep = -1;
     private static DateTime cycleNext;
@@ -46,8 +51,14 @@ public static class TestHooks
         if (loadName != null && !paused && playingFrames > 5)
         {
             paused = true;
-            Find.TickManager.CurTimeSpeed = TimeSpeed.Paused;
+            Find.TickManager.CurTimeSpeed = Environment.GetEnvironmentVariable("RESHADE_TEST_RUN") == "1" ? TimeSpeed.Superfast : TimeSpeed.Paused;
             Log.Message("[ReShade] test save loaded and paused");
+        }
+        if (world && paused && !worldShown && playingFrames > 120)
+        {
+            worldShown = true;
+            CameraJumper.TryShowWorld();
+            Log.Message("[ReShade] test world map shown");
         }
         if (cycleDir != null && paused)
         {

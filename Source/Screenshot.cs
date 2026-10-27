@@ -37,6 +37,7 @@ public static class Screenshot
             Priority = 0.5f
         };
         BufferAllocationInfo buffer = allocator.AllocateBufferChecked("ReShade.Screenshot", in bufferInfo, in allocInfo);
+        long id = GpuLedger.Take("Screenshot");
 
         VkImageMemoryBarrier pre = GpuUtil.Barrier(image, VkImageLayout.ShaderReadOnlyOptimal, VkImageLayout.TransferSrcOptimal,
             VkAccessFlags.ColorAttachmentWriteBit | VkAccessFlags.TransferWriteBit, VkAccessFlags.TransferReadBit);
@@ -66,6 +67,7 @@ public static class Screenshot
             new ReadOnlySpan<byte>(mapped, size).CopyTo(pixels);
             allocator.UnmapMemory(in map);
             allocator.FreeAllocation(in buffer);
+            GpuLedger.Free(id);
             Task.Run(() =>
             {
                 for (int i = 0; i < size; i += 4)

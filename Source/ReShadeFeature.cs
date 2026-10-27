@@ -302,13 +302,12 @@ public sealed class ReShadeFeature : IRenderFeature, IRenderPass
         GpuGarbage.Close();
         foreach (Effect e in builtEffects)
         {
-            e.Dispose();
+            QuitTrace.Try(e.Name, e.Dispose);
         }
-        backBufferA?.Dispose();
-        backBufferB?.Dispose();
-        standIn?.Dispose();
-        standIn1D?.Dispose();
-        standIn3D?.Dispose();
+        foreach (FxTexture t in new[] { backBufferA, backBufferB, standIn, standIn1D, standIn3D })
+        {
+            QuitTrace.Try(t?.Name, () => t?.Dispose());
+        }
     }
 }
 

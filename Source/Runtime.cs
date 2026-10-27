@@ -203,6 +203,7 @@ public sealed class Runtime
     public void Tick()
     {
         tick++;
+        QuitCleanup.Tick();
         TestHooks.Tick(this);
         HandleChanges();
         if (tick % 30 == 0)
@@ -475,6 +476,11 @@ public sealed class Runtime
     // publishes the enabled techniques to the render thread and remembers them in the preset
     public void Publish()
     {
+        // quitting: the effects stay off so their memory can be freed
+        if (QuitCleanup.Quitting)
+        {
+            return;
+        }
         FindPresetEffects();
         // the Game list runs on the map, or with "also change the UI" on the whole screen after the UI is drawn, like ReShade
         bool whole = Preset.GameChangesUI && Layers != null;
