@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using RimWorld;
@@ -54,7 +55,33 @@ public static class TestHooks
             Find.TickManager.CurTimeSpeed = Environment.GetEnvironmentVariable("RESHADE_TEST_RUN") == "1" ? TimeSpeed.Superfast : TimeSpeed.Paused;
             Log.Message("[ReShade] test save loaded and paused");
         }
-        if (world && paused && !worldShown && playingFrames > 120)
+        if (Environment.GetEnvironmentVariable("RESHADE_TEST_NODEPTH") == "1")
+        {
+            rt.Feature.UseDepth = false;
+        }
+        if (world && paused && playingFrames == 60)
+        {
+            // midday, the camera on a power conduit, so there's a bright line on the map before going to the world
+            Map map = Find.CurrentMap;
+            int hour = GenLocalDate.HourOfDay(map);
+            Find.TickManager.DebugSetTicksGame(Find.TickManager.TicksGame + (12 - hour + 24) % 24 * GenDate.TicksPerHour);
+            // a horizontal stretch: conduits on both sides
+            var conduits = map.listerThings.ThingsOfDef(ThingDefOf.PowerConduit);
+            var cells = new HashSet<IntVec3>(conduits.Select(c => c.Position));
+            Thing conduit = conduits.FirstOrDefault(c => cells.Contains(c.Position + IntVec3.East) && cells.Contains(c.Position + IntVec3.West)
+                && cells.Contains(c.Position + IntVec3.East * 2) && cells.Contains(c.Position + IntVec3.West * 2));
+            Log.Message("[ReShade] test conduit " + (conduit?.Position.ToString() ?? "none"));
+            if (conduit != null)
+            {
+                Find.CameraDriver.SetRootPosAndSize(conduit.DrawPos, 15f);
+            }
+        }
+        if (world && paused && playingFrames == 200 && cycleDir != null)
+        {
+            Directory.CreateDirectory(Path.Combine(cycleDir, "shots"));
+            rt.Feature.ScreenshotRequest = Path.Combine(cycleDir, "shots", "0-map");
+        }
+        if (world && paused && !worldShown && playingFrames > 260)
         {
             worldShown = true;
             CameraJumper.TryShowWorld();

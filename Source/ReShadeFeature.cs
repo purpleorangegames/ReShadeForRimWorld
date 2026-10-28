@@ -38,6 +38,9 @@ public sealed class ReShadeFeature : IRenderFeature, IRenderPass
     private readonly HashSet<Effect> builtEffects = new();
     public volatile bool Enabled = true;
     public volatile bool UseDepth = true;
+    // the game doesn't write depth on the world map, it still has the last map frame's: effects would draw the colony
+    // over the world, so there they get no depth
+    public volatile bool OnWorld;
     public volatile string ScreenshotRequest;
 
     public readonly ConcurrentQueue<string> Messages = new();
@@ -187,7 +190,7 @@ public sealed class ReShadeFeature : IRenderFeature, IRenderPass
                 Screenshot.Capture(cmd, ctx.GraphicsDevice, original.Image, original.Format, original.Width, original.Height, screenshot + " original.png", Say);
             }
 
-            io.HasDepth = UseDepth && source.HasDepth;
+            io.HasDepth = UseDepth && !OnWorld && source.HasDepth;
             io.Depth = default;
             // the depth only changes layout when an effect samples it
             if (io.HasDepth && usesDepth)

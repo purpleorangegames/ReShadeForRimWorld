@@ -5,6 +5,7 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
+using Verse;
 
 namespace ReShadeForRimWorld;
 
@@ -204,6 +205,7 @@ public sealed class Runtime
     {
         tick++;
         QuitCleanup.Tick();
+        Feature.OnWorld = Current.ProgramState == ProgramState.Playing && RimWorld.Planet.WorldRendererUtility.WorldRendered;
         TestHooks.Tick(this);
         HandleChanges();
         if (tick % 30 == 0)
