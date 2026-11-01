@@ -64,8 +64,10 @@ public sealed class Runtime
         Directory.CreateDirectory(ReShadeMod.ShadersDir);
         Directory.CreateDirectory(ReShadeMod.TexturesDir);
         Preset = Preset.Load(Settings.PresetPath);
+        Diag.Log($"settings {Settings.Path}, overlay key {Overlay.KeyName(Settings.OverlayKey)}, preset {Preset.Path} (exists {File.Exists(Preset.Path)}), techniques on: {string.Join(", ", Preset.Techniques)}");
         Watch();
         ScanEffects();
+        Diag.Log($"{Effects.Count} effects in {ReShadeMod.ShadersDir}: {string.Join(", ", Effects.Select(e => e.Name))}");
         Feature.IncludePaths = IncludePaths();
         Feature.TexturePaths = new List<string> { ReShadeMod.TexturesDir };
     }
@@ -207,6 +209,7 @@ public sealed class Runtime
         QuitCleanup.Tick();
         Feature.OnWorld = Current.ProgramState == ProgramState.Playing && RimWorld.Planet.WorldRendererUtility.WorldRendered;
         TestHooks.Tick(this);
+        Diag.Tick(this);
         HandleChanges();
         if (tick % 30 == 0)
         {
@@ -299,14 +302,18 @@ public sealed class Runtime
                 e.Compiling = true;
                 System.Threading.Interlocked.Increment(ref running);
                 string path = e.FilePath;
+                Diag.Log($"compiling {e.Name} for {width}x{height}");
                 Task.Run(() =>
                 {
                     try
                     {
+                        var watch = System.Diagnostics.Stopwatch.StartNew();
                         e.Result = Effect.Compile(path, width, height, include, defines, key, performance);
+                        Diag.Log($"compiled {e.Name} in {watch.ElapsedMilliseconds} ms, success {e.Result.Success}");
                     }
                     catch (Exception ex)
                     {
+                        Diag.Log($"compiling {e.Name} threw: {ex}");
                         e.Result = new Effect.CompileResult { Errors = ex.Message, Width = width, Height = height, Defines = key, PerformanceMode = performance };
                     }
                     finally
@@ -488,6 +495,7 @@ public sealed class Runtime
         bool whole = Preset.GameChangesUI && Layers != null;
         RenderItem[] game = Techniques.Where(t => t.Enabled).Select(t => new RenderItem { Effect = whole ? ScreenCopy(t.Effect) : t.Effect, Technique = t.Name }).ToArray();
         Feature.RenderList = whole ? Array.Empty<RenderItem>() : game;
+        Diag.Log($"on {(whole ? "the whole screen" : "the map")}: {string.Join(", ", game.Select(i => i.Technique))}");
         if (Layers != null)
         {
             Layers.ScreenList = whole ? game : Array.Empty<RenderItem>();
@@ -584,6 +592,7 @@ public sealed class Runtime
 
     public void LoadPreset(string path)
     {
+        Diag.Log("loading preset " + path);
         SavePreset();
         Preset = Preset.Load(path);
         Settings.PresetPath = path;

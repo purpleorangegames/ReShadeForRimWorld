@@ -17,6 +17,14 @@
     <OutputPath>../1.7/Assemblies/</OutputPath>
   </PropertyGroup>
 
+  <!-- dotnet build -c Release -p:Diagnostic=true builds the diagnostic mod, see Diagnostic/build.sh -->
+  <PropertyGroup Condition="'$(Diagnostic)' == 'true'">
+    <AssemblyName>ReShadeForRimWorldDiagnostic</AssemblyName>
+    <DefineConstants>$(DefineConstants);DIAGNOSTIC</DefineConstants>
+    <OutputPath>../../ReShadeForRimWorldDiagnostic/1.7/Assemblies/</OutputPath>
+    <IntermediateOutputPath>obj/Diagnostic/$(Configuration)/</IntermediateOutputPath>
+  </PropertyGroup>
+
   <ItemGroup>
     <!-- reference only, the game and the Harmony mod provide the real dlls -->
     <PackageReference Include="Krafs.Rimworld.Ref" Version="1.7.4985-unstable" ExcludeAssets="runtime" PrivateAssets="all" />

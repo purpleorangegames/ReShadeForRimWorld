@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Threading;
 using Brutal.VulkanApi;
 using HarmonyLib;
@@ -86,6 +87,7 @@ public sealed class ReShadeFeature : IRenderFeature, IRenderPass
     // nothing here runs every frame, so every message is worth showing
     public void Say(string message)
     {
+        Diag.Log(message);
         Messages.Enqueue(message);
     }
 
@@ -101,8 +103,10 @@ public sealed class ReShadeFeature : IRenderFeature, IRenderPass
             Say("[ReShade] runtime error: " + e);
         }
         ReShadeMod.FlushMessages();
+        Diag.First("capture", 3, $"frame start: effects on {Enabled}, game post fx active {postFx.IsActive}, {Verse.Current.ProgramState}");
         if (!Enabled || !postFx.IsActive)
         {
+            Diag.Count("frames skipped, effects or post fx off");
             frameCount++;
             return null;
         }
@@ -140,11 +144,13 @@ public sealed class ReShadeFeature : IRenderFeature, IRenderPass
         string screenshotRequest = ScreenshotRequest;
         if (featurePayload is not FrameData data || (list.Length == 0 && screenshotRequest == null))
         {
+            Diag.Count("frames with nothing to run");
             return;
         }
         RenderTexture source = scene(frame);
         if (source == null)
         {
+            Diag.First("no scene", 5, "no scene image this frame");
             return;
         }
         CommandBuffer cmd = ctx.CommandBuffer;
@@ -207,7 +213,12 @@ public sealed class ReShadeFeature : IRenderFeature, IRenderPass
                     builtEffects.Add(item.Effect);
                     item.Effect.RecordTechnique(in ctx, io, item.Technique);
                 }
+                else
+                {
+                    Diag.First("not ready " + item.Technique, 3, $"{item.Technique} ({item.Effect.Name}) is on but not compiled yet or failed");
+                }
             }
+            Diag.First("frames with effects", 3, $"effects ran: {string.Join(", ", list.Select(i => i.Technique))} on {source.Width}x{source.Height} {source.ColorFormat}, depth {io.HasDepth}");
 
             if (screenshot != null)
             {
@@ -327,8 +338,10 @@ public static class CompositeInput
         VkImageView view = ReShadeMod.Feature.OutputFor(ctx.SubmissionFrameIndex);
         if (view.IsNull())
         {
+            Diag.Count("composite drew the plain scene");
             return true;
         }
+        Diag.Count("composite drew the effects");
         __instance.SetInput(0, view, __instance.Sampler);
         __instance.SetUniforms(__instance.Saturation);
         __instance.RecordInline(in ctx, ctx.RenderPass, ctx.SampleCount);

@@ -32,6 +32,7 @@ public static class InputHook
     [HarmonyPatch(Bridge, "OnMouseButton"), HarmonyPrefix]
     public static bool MouseButton(GlfwMouseButton button, GlfwButtonAction action, GlfwModifier mods)
     {
+        Diag.First("mouse", 20, $"mouse {button} {action}, overlay {(Overlay.Open ? "open" : "closed")}");
         if (!Overlay.Open || (int)button > 4)
         {
             return true;
@@ -59,6 +60,7 @@ public static class InputHook
     public static bool Key(GlfwKey key, GlfwKeyAction action, GlfwModifier mods)
     {
         Runtime rt = ReShadeMod.Runtime;
+        Diag.First("key", 40, $"key {key} ({(int)key}) {action} {mods}");
         if (rt == null)
         {
             return true;
@@ -86,6 +88,7 @@ public static class InputHook
             if (action == GlfwKeyAction.Press)
             {
                 Overlay.Open = !Overlay.Open;
+                Diag.Log("overlay key, overlay " + (Overlay.Open ? "open" : "closed"));
             }
             return false;
         }
@@ -130,6 +133,7 @@ public static class InputHook
     [HarmonyPatch("RimWorldWaylith.Imgui.ImGuiHost", "EndFrame"), HarmonyPrefix]
     public static void EndFrame()
     {
+        Diag.Count("ImGui frames");
         try
         {
             EnsureClipboard();

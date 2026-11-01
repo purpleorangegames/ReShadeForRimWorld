@@ -39,9 +39,17 @@ public static class Overlay
         {
             System.IO.Directory.CreateDirectory(path);
             string opener = OperatingSystem.IsWindows() ? "explorer.exe" : OperatingSystem.IsMacOS() ? "open" : "xdg-open";
-            var info = new System.Diagnostics.ProcessStartInfo(opener) { UseShellExecute = false };
+            // its output is read here instead of going to the game's, the first open sometimes did nothing without it
+            var info = new System.Diagnostics.ProcessStartInfo(opener) { UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true };
             info.ArgumentList.Add(path);
-            System.Diagnostics.Process.Start(info);
+            Diag.Log($"running {opener} {path}");
+            var p = System.Diagnostics.Process.Start(info);
+            System.Threading.Tasks.Task.Run(() =>
+            {
+                string output = p.StandardOutput.ReadToEnd(), error = p.StandardError.ReadToEnd();
+                p.WaitForExit();
+                Diag.Log($"{opener} exited {p.ExitCode}, output [{output.Trim()}], errors [{error.Trim()}]");
+            });
         }
         catch (Exception e)
         {
@@ -62,6 +70,12 @@ public static class Overlay
             testEditorOpened = true;
             Editor.Open(testEditFile);
         }
+        Diag.First("draw", 3, $"overlay draw called, open {Open}");
+        if (Open != diagWasOpen)
+        {
+            diagWasOpen = Open;
+            Diag.Log("overlay is now " + (Open ? "open" : "closed"));
+        }
         if (!Open)
         {
             DrawBanner(rt);
@@ -78,6 +92,17 @@ public static class Overlay
         Editor.DrawAll(rt);
     }
 
+    private static bool diagWasOpen;
+
+    // what ImGui made of a window, inside its Begin/End
+    private static void DiagWindow(string name, bool shown)
+    {
+        ImGuiIOPtr io = ImGui.GetIO();
+        float2 pos = ImGui.GetWindowPos(), size = ImGui.GetWindowSize();
+        Diag.First(name, 3, $"{name}: begin {shown}, at {pos.X:0},{pos.Y:0} size {size.X:0}x{size.Y:0}, collapsed {ImGui.IsWindowCollapsed()}, " +
+            $"screen {io.DisplaySize.X:0}x{io.DisplaySize.Y:0} scale {io.DisplayFramebufferScale.X:0.##}");
+    }
+
     // like ReShade's startup message, shown for a few seconds or while effects compile
     private static void DrawBanner(Runtime rt)
     {
@@ -89,7 +114,9 @@ public static class Overlay
         }
         ImGui.SetNextWindowPos(new float2 { X = 10, Y = 10 });
         ImGuiWindowFlags flags = ImGuiWindowFlags.NoDecoration | ImGuiWindowFlags.NoInputs | ImGuiWindowFlags.AlwaysAutoResize | ImGuiWindowFlags.NoSavedSettings | ImGuiWindowFlags.NoFocusOnAppearing | ImGuiWindowFlags.NoNav;
-        if (ImGui.Begin("##ReShadeBanner", flags))
+        bool bannerShown = ImGui.Begin("##ReShadeBanner", flags);
+        DiagWindow("banner", bannerShown);
+        if (bannerShown)
         {
             ImGui.Text("ReShade for RimWorld (unofficial)");
             ImGui.Text($"Press {KeyName(rt.Settings.OverlayKey)} to open the overlay.");
@@ -111,7 +138,9 @@ public static class Overlay
         ImGui.SetNextWindowPos(new float2 { X = 20, Y = 20 }, ImGuiCond.FirstUseEver);
         ImGui.SetNextWindowSize(new float2 { X = 680, Y = 820 }, ImGuiCond.FirstUseEver);
         bool open = true;
-        if (ImGui.Begin("ReShade for RimWorld##ReShadeMain", ref open))
+        bool shown = ImGui.Begin("ReShade for RimWorld##ReShadeMain", ref open);
+        DiagWindow("overlay window", shown);
+        if (shown)
         {
             DrawPresetBar(rt);
             if (ImGui.BeginTabBar("##tabs"))

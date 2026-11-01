@@ -13,6 +13,8 @@ namespace ReShadeForRimWorld;
 // RESHADE_PERF_LOG=1        logs the GPU time of the mod's work every few seconds
 // RESHADE_TEST_CYCLE=<dir>  after loading, goes through every preset .ini in dir and saves a screenshot of each to dir/shots
 // RESHADE_TEST_RUN=1        after loading, lets the time run instead of pausing
+// RESHADE_TEST_BENCH=<s>   after loading, runs at the fastest speed for that many seconds, logs ticks per second and
+//                           garbage collection, then quits
 // RESHADE_TEST_WORLD=1      after loading, goes to the world map (with the cycle, to see the effects there)
 public static class TestHooks
 {
@@ -25,6 +27,11 @@ public static class TestHooks
     private static readonly string cycleDir = Environment.GetEnvironmentVariable("RESHADE_TEST_CYCLE");
     private static readonly bool world = Environment.GetEnvironmentVariable("RESHADE_TEST_WORLD") == "1";
     private static bool worldShown;
+    private static readonly int benchSeconds = int.TryParse(Environment.GetEnvironmentVariable("RESHADE_TEST_BENCH"), out int b) ? b : 0;
+    private static DateTime benchStart;
+    private static int benchTicks, benchFrames;
+    private static int[] benchGc;
+    private static TimeSpan benchPause;
     private static string[] cycle;
     private static int cycleStep = -1;
     private static DateTime cycleNext;
@@ -58,6 +65,10 @@ public static class TestHooks
         if (Environment.GetEnvironmentVariable("RESHADE_TEST_NODEPTH") == "1")
         {
             rt.Feature.UseDepth = false;
+        }
+        if (benchSeconds > 0 && paused)
+        {
+            Bench();
         }
         if (world && paused && playingFrames == 60)
         {
@@ -97,6 +108,34 @@ public static class TestHooks
             Log.Message("[ReShade] order: " + string.Join(",", rt.Feature.RenderList.Select(i => i.Technique)));
             Log.Message($"[ReShade] perf: map {rt.Feature.Timer.AverageMs:0.000} ms, layers {(rt.Layers?.Timer.AverageMs ?? 0):0.000} ms, techniques {rt.Feature.RenderList.Length}+{rt.Layers?.ScreenList.Length ?? 0}+{rt.Layers?.UiList.Length ?? 0}");
         }
+    }
+
+    private static void Bench()
+    {
+        if (benchStart == default)
+        {
+            if (playingFrames < 120)
+            {
+                return;
+            }
+            Find.TickManager.CurTimeSpeed = TimeSpeed.Ultrafast;
+            benchStart = DateTime.UtcNow;
+            benchTicks = Find.TickManager.TicksGame;
+            benchFrames = playingFrames;
+            benchGc = new[] { GC.CollectionCount(0), GC.CollectionCount(1), GC.CollectionCount(2) };
+            benchPause = GC.GetTotalPauseDuration();
+            Log.Message($"[ReShade] bench start, gc {System.Runtime.GCSettings.IsServerGC} server, latency {System.Runtime.GCSettings.LatencyMode}");
+            return;
+        }
+        double s = (DateTime.UtcNow - benchStart).TotalSeconds;
+        if (s < benchSeconds)
+        {
+            return;
+        }
+        int ticks = Find.TickManager.TicksGame - benchTicks;
+        Log.Message($"[ReShade] bench {s:0.0}s: {ticks / s:0} ticks/s, {(playingFrames - benchFrames) / s:0} fps, gc gen0 {GC.CollectionCount(0) - benchGc[0]} gen1 {GC.CollectionCount(1) - benchGc[1]} gen2 {GC.CollectionCount(2) - benchGc[2]}, paused {(GC.GetTotalPauseDuration() - benchPause).TotalMilliseconds:0} ms, heap {GC.GetTotalMemory(false) / 1048576} MB");
+        benchStart = DateTime.MaxValue;
+        Root.Shutdown();
     }
 
     // even steps load preset step/2, odd steps take its screenshot

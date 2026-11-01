@@ -27,7 +27,17 @@ public static unsafe class NativeFx
             return IntPtr.Zero;
         }
         string file = OperatingSystem.IsWindows() ? "reshadefx.dll" : OperatingSystem.IsMacOS() ? "libreshadefx.dylib" : "libreshadefx.so";
-        return NativeLibrary.Load(Path.Combine(NativeDir, file));
+        string full = Path.Combine(NativeDir, file);
+        Diag.First("native", 1, $"loading {full}, exists {File.Exists(full)}");
+        try
+        {
+            return NativeLibrary.Load(full);
+        }
+        catch (Exception e)
+        {
+            Diag.Log("loading the compiler failed: " + e);
+            throw;
+        }
     }
 
     [DllImport(Lib)] private static extern IntPtr rfx_compile2(byte* path, byte** includePaths, int includeCount, byte** defines, int defineCount, int performanceMode);

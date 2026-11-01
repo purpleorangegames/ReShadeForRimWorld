@@ -58,7 +58,9 @@ public class ReShadeMod : Mod
 
     public ReShadeMod(ModContentPack content) : base(content)
     {
+        Diag.Start(content);
         NativeFx.Init(content.RootDir);
+        Diag.TestCompiler();
         LongEventHandler.ExecuteWhenFinished(Install);
     }
 
@@ -69,6 +71,24 @@ public class ReShadeMod : Mod
     {
         var list = new Listing_Standard();
         list.Begin(inRect);
+#if DIAGNOSTIC
+        list.Label("Diagnostic build. It keeps a log of everything the mod does since the game started, nothing is saved until you click the button. Send the saved file to the mod author, then go back to the normal mod.");
+        if (list.ButtonText("Save the log and open its folder"))
+        {
+            Diag.Log("save button clicked");
+            try
+            {
+                Diag.Log("saved " + Diag.Save());
+            }
+            catch (Exception e)
+            {
+                Log.Error("[ReShade] could not save the diagnostic log: " + e);
+            }
+            Overlay.OpenFolder(Diag.LogDir);
+        }
+        list.Label("Folder: " + Diag.LogDir);
+        list.GapLine();
+#endif
         if (Runtime == null)
         {
             list.Label("The effects could not start, see the log.");
@@ -102,6 +122,7 @@ public class ReShadeMod : Mod
         list.Gap();
         if (list.ButtonText("Open the overlay"))
         {
+            Diag.Log("open the overlay button clicked");
             Overlay.Open = true;
         }
         list.End();
@@ -111,9 +132,11 @@ public class ReShadeMod : Mod
     {
         try
         {
+            Diag.Log("hooking into rendering");
             EngineApplication app = EngineApplication.Instance;
             if (app == null)
             {
+                Diag.Log("no engine application");
                 Log.Warning("[ReShade] no engine application, effects off");
                 return;
             }
@@ -121,6 +144,7 @@ public class ReShadeMod : Mod
             var sceneTargets = (SceneColorTargets)bootstrap.GetField("_sceneTargets", BindingFlags.NonPublic | BindingFlags.Static).GetValue(null);
             var composite = (CompositePass)bootstrap.GetField("_composite", BindingFlags.NonPublic | BindingFlags.Static).GetValue(null);
             FrameRenderer renderer = app.FrameRenderer;
+            Diag.Log($"scene targets {sceneTargets != null}, composite {composite != null}, render features: " + string.Join(", ", Enumerable.Range(0, renderer.GetFeatureCount()).Select(i => renderer.GetFeatureAt(i).GetType().FullName)));
             int index = -1;
             for (int i = 0; i < renderer.GetFeatureCount(); i++)
             {
@@ -132,6 +156,7 @@ public class ReShadeMod : Mod
             }
             if (sceneTargets == null || composite == null || index < 0)
             {
+                Diag.Log("could not find the game's post processing, post fx index " + index);
                 Log.Warning("[ReShade] could not find the game's post processing, effects off");
                 return;
             }
@@ -159,13 +184,22 @@ public class ReShadeMod : Mod
             }
             else
             {
+                Diag.Log("could not find the game's UI pass");
                 Log.Warning("[ReShade] could not find the game's UI pass, the UI tab won't do anything");
             }
+            Diag.Log($"inserted at {index} and {uiIndex + 1}");
+#if DIAGNOSTIC
+            // one class at a time, so a patch that fails doesn't hide the others
+            Diag.Patch(new Harmony("tiagocc0.reshadeforrimworld"));
+#else
             new Harmony("tiagocc0.reshadeforrimworld").PatchAll();
+#endif
+            Diag.Log($"ready, {Runtime.Effects.Count} effects, preset {Runtime.Preset.Path}");
             Log.Message($"[ReShade] ready, {Runtime.Effects.Count} effects in {ShadersDir}, preset {Runtime.Preset.Path}");
         }
         catch (Exception e)
         {
+            Diag.Log("failed to hook into rendering: " + e);
             Log.Error("[ReShade] failed to hook into rendering: " + e);
         }
     }
